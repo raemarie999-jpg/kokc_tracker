@@ -7,8 +7,19 @@ app = Flask(__name__)
 
 API_KEY = os.environ.get("WETHR_API_KEY", "")
 STATION = "KOKC"
-MODELS = ["ARPEGE","HRRR","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NWS","NAM-MOS","NBM"]
-RUN_CYCLES = ["00Z","03Z","06Z","09Z","12Z","15Z","18Z","21Z"]
+ALL_KNOWN_MODELS = [
+    "ARPEGE","HRRR","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NWS","NAM-MOS","NBM",
+    "NAM4KM","GFS","ICON","GFS-MOS","ECMWF-HRES","GEFS","JMA","RDPS","SREF","NBM-ENS"
+]
+RUN_CYCLES = ["00Z","01Z","02Z","03Z","04Z","05Z","06Z","07Z","08Z","09Z","10Z","11Z",
+              "12Z","13Z","14Z","15Z","16Z","17Z","18Z","19Z","20Z","21Z","22Z","23Z"]
+
+def active_models():
+    """Return today's ranked models from accuracy data, or fall back to known list."""
+    acc = state.get("accuracy", {})
+    if acc:
+        return list(acc.keys())
+    return ALL_KNOWN_MODELS[:10]
 REFRESH_SEC = 300  # 5 minutes
 
 # In-memory state
@@ -63,7 +74,7 @@ def fetch_all():
         add_log(f"Wethr High error: {e}", "err")
 
     # Forecasts per model
-    for model in MODELS:
+    for model in active_models():
         try:
             data = wethr_get(f"forecasts.php?location_name={STATION}&model={requests.utils.quote(model)}&run=latest")
             temps = data if isinstance(data, list) else data.get("forecasts", [])
@@ -93,7 +104,8 @@ def background_loop():
 def api_state():
     acc = state["accuracy"]
     rows = []
-    for i, model in enumerate(MODELS):
+    models = active_models()
+    for i, model in enumerate(models):
         a = acc.get(model, {})
         fcst = state["forecasts"].get(model, {})
         raw = fcst.get("high")
@@ -134,6 +146,7 @@ def api_state():
         "last_updated": state["last_updated"],
         "errors": state["errors"],
         "log": state["log"][:30],
+        "models": active_models(),
     })
 
 @app.route("/api/accuracy", methods=["POST"])
@@ -405,9 +418,13 @@ HTML = r"""<!DOCTYPE html>
 </main>
 
 <script>
-const MODELS = ["ARPEGE","HRRR","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NWS","NAM-MOS","NBM"];
+const ALL_KNOWN_MODELS = ["ARPEGE","HRRR","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NWS","NAM-MOS","NBM",
+  "NAM4KM","GFS","ICON","GFS-MOS","ECMWF-HRES","GEFS","JMA","RDPS","SREF","NBM-ENS"];
+let MODELS = ALL_KNOWN_MODELS.slice(0,10); // updated dynamically from server
 const RUNS = ["00Z","03Z","06Z","09Z","12Z","15Z","18Z","21Z"];
 let accData = JSON.parse(localStorage.getItem("kokc_acc") || "{}");
+// Restore model order from last saved accuracy data
+if(Object.keys(accData).length) MODELS = Object.keys(accData);
 let countdown = 300;
 let countdownTimer;
 
@@ -476,6 +493,7 @@ function loadFromJSON(){
     const known = MODELS.filter(m => parsed[m]);
     if(known.length === 0){ status.style.color="var(--red)"; status.textContent="No recognisable models found in JSON."; return; }
     accData = parsed;
+    MODELS = Object.keys(parsed); // update model list immediately
     localStorage.setItem("kokc_acc", JSON.stringify(parsed));
     localStorage.setItem("kokc_acc_time", new Date().toLocaleString());
     fetch("/api/accuracy",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(parsed)})
@@ -550,6 +568,7 @@ function clearAccuracy(){
 
 // ── Render state ──────────────────────────────────────────────────────────────
 function render(data){
+  if(data.models && data.models.length) MODELS = data.models;
   const obs = data.obs;
   const wh = data.wethr_high;
   const rows = data.rows;
