@@ -1,5 +1,5 @@
 import os, json, time, threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, render_template_string
 import requests
 
@@ -7,32 +7,31 @@ app = Flask(__name__)
 
 API_KEY = os.environ.get("WETHR_API_KEY", "")
 STATION = "KOKC"
+
 ALL_KNOWN_MODELS = [
-    "ARPEGE","HRRR","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NWS","NAM-MOS","NBM",
-    "NAM4KM","GFS","ICON","GFS-MOS","ECMWF-HRES","GEFS","JMA","RDPS","SREF","NBM-ENS"
+    "ARPEGE","HRRR","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NAM-MOS","NBM",
+    "NAM4KM","GFS","ICON","GFS-MOS","ECMWF-HRES","GEFS","JMA","RDPS","SREF"
 ]
 RUN_CYCLES = ["00Z","01Z","02Z","03Z","04Z","05Z","06Z","07Z","08Z","09Z","10Z","11Z",
               "12Z","13Z","14Z","15Z","16Z","17Z","18Z","19Z","20Z","21Z","22Z","23Z"]
+REFRESH_SEC = 300
 
-def active_models():
-    """Return today's ranked models from accuracy data, or fall back to known list."""
-    acc = state.get("accuracy", {})
-    if acc:
-        return list(acc.keys())
-    return ALL_KNOWN_MODELS[:10]
-REFRESH_SEC = 300  # 5 minutes
-
-# In-memory state
 state = {
     "obs": None,
     "wethr_high": None,
     "forecasts": {},
+    "nws_versions": {},
     "accuracy": {},
     "last_updated": None,
     "errors": [],
-    "log": [],
-    "nws_versions": {}
+    "log": []
 }
+
+def active_models():
+    acc = state.get("accuracy", {})
+    # Exclude NWS from regular model list - handled separately
+    models = [m for m in acc.keys() if m != "NWS"] if acc else ALL_KNOWN_MODELS[:9]
+    return models
 
 def add_log(msg, level="info"):
     entry = {"t": datetime.now().strftime("%H:%M:%S"), "msg": msg, "level": level}
@@ -49,6 +48,35 @@ def wethr_get(path):
     r.raise_for_status()
     return r.json()
 
+def get_temp(x):
+    for k in ["temperature_f","temperature_display","temperature","temp","value","high"]:
+        v = x.get(k)
+        if v is not None:
+            try: return round(float(v), 1)
+            except: pass
+    return None
+
+def parse_vt(x):
+    vt = str(x.get("valid_time",""))
+    try: return datetime.strptime(vt[:16], "%Y-%m-%d %H:%M")
+    except: return None
+
+def today_entries(temps):
+    utc_now = datetime.utcnow()
+    okc_local = utc_now - timedelta(hours=5)
+    day_start = okc_local.replace(hour=0,minute=0,second=0,microsecond=0) + timedelta(hours=5)
+    day_end = day_start + timedelta(hours=24)
+    filtered = [x for x in temps if parse_vt(x) is not None and day_start <= parse_vt(x) < day_end]
+    return filtered if filtered else temps
+
+def fmt_run(run_raw):
+    try:
+        if len(run_raw) >= 13:
+            return run_raw[11:13] + "Z"
+        return run_raw or "—"
+    except:
+        return "—"
+
 def fetch_all():
     if not API_KEY:
         add_log("No API key set", "err")
@@ -56,11 +84,11 @@ def fetch_all():
     add_log("Fetching data...")
     errors = []
 
-    # Latest observation
+    # Observation
     try:
         obs = wethr_get(f"observations.php?station_code={STATION}&mode=latest")
         state["obs"] = obs
-        add_log(f"Obs: {obs.get('temperature_display')}°F", "ok")
+        add_log(f"Obs: {obs.get('temperature_display')}F", "ok")
     except Exception as e:
         errors.append(f"Obs: {e}")
         add_log(f"Obs error: {e}", "err")
@@ -69,199 +97,124 @@ def fetch_all():
     try:
         wh = wethr_get(f"observations.php?station_code={STATION}&mode=wethr_high&logic=nws")
         state["wethr_high"] = wh
-        add_log(f"Wethr High: {wh.get('wethr_high')}°F", "ok")
+        add_log(f"Wethr High: {wh.get('wethr_high')}F", "ok")
     except Exception as e:
         errors.append(f"WethrHigh: {e}")
         add_log(f"Wethr High error: {e}", "err")
 
     # Forecasts per model
+    utc_now = datetime.utcnow()
     for model in active_models():
         try:
-            if model == "NWS": continue  # NWS handled separately
             data = wethr_get(f"forecasts.php?location_name={STATION}&model={requests.utils.quote(model)}&run=latest")
-            # API returns either a list directly or a dict with a forecasts key
-            if isinstance(data, list):
-                temps = data
-                meta = {}
-            else:
-                temps = data.get("forecasts", [])
-                meta = data
-
+            temps = data if isinstance(data, list) else data.get("forecasts", [])
+            meta = {} if isinstance(data, list) else data
             if temps:
-                def get_temp(x):
-                    for k in ["temperature_f","temperature_display","temperature","temp","value","high"]:
-                        v = x.get(k)
-                        if v is not None:
-                            try: return round(float(v), 1)
-                            except: pass
-                    return None
-
-                # OKC is CDT (UTC-5). Local day runs from 05:00 UTC to 04:59 UTC next day.
-                from datetime import timedelta
-                utc_now = datetime.utcnow()
-                # Start of today in OKC = today at 05:00 UTC (midnight CDT)
-                okc_local = utc_now - timedelta(hours=5)
-                day_start_utc = okc_local.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(hours=5)
-                day_end_utc = day_start_utc + timedelta(hours=24)
-                def parse_vt(x):
-                    vt = str(x.get("valid_time",""))
-                    try: return datetime.strptime(vt[:16], "%Y-%m-%d %H:%M")
-                    except: return None
-                today_temps = [x for x in temps if parse_vt(x) is not None and day_start_utc <= parse_vt(x) < day_end_utc]
-                if not today_temps:
-                    today_temps = temps  # fallback
-
-                # Max temp among today's entries = forecast high
-                max_entry = max(today_temps, key=lambda x: get_temp(x) or 0)
+                todays = today_entries(temps)
+                max_entry = max(todays, key=lambda x: get_temp(x) or 0)
                 raw_temp = get_temp(max_entry)
-
-                # Current-hour entry = temp model predicted for right now (for pacing)
-                now_utc = datetime.utcnow()
-                def time_diff(x):
-                    vt = x.get("valid_time","")
-                    try:
-                        from datetime import datetime as dt
-                        t = dt.strptime(vt[:16], "%Y-%m-%d %H:%M")
-                        return abs((t - now_utc).total_seconds())
-                    except:
-                        return float("inf")
-                current_entry = min(temps, key=time_diff)
-                current_temp = get_temp(current_entry)
-                # Get run time and format as e.g. "12Z"
-                run_raw = (meta.get("run_time") or meta.get("run") or
-                           max_entry.get("run_time") or max_entry.get("run") or "")
-                try:
-                    # Convert "2026-05-23 06:00:00" -> "06Z"
-                    run_fmt = run_raw[11:13] + "Z" if len(run_raw) >= 13 else run_raw or "—"
-                except:
-                    run_fmt = run_raw or "—"
+                closest = min(todays, key=lambda x: abs((parse_vt(x) - utc_now).total_seconds()) if parse_vt(x) else 99999)
+                current_temp = get_temp(closest)
+                run_raw = meta.get("run_time") or max_entry.get("run_time") or max_entry.get("run") or ""
+                run_fmt = fmt_run(run_raw)
                 state["forecasts"][model] = {
                     "high": raw_temp,
                     "current_fcst": current_temp,
                     "run": run_fmt,
-                    "forecast_time": (meta.get("valid_time") or max_entry.get("valid_time") or
-                                      max_entry.get("forecast_time") or max_entry.get("time") or "—"),
                 }
-                add_log(f"{model}: high={raw_temp}° now={current_temp}° run {run_fmt} (today_entries={len(today_temps)})", "ok")
+                add_log(f"{model}: high={raw_temp} now={current_temp} run={run_fmt} ({len(todays)} entries)", "ok")
         except Exception as e:
-            err_str = str(e)
-            errors.append(f"{model}: {err_str}")
-            add_log(f"{model} error: {err_str[:80]}", "warn")
+            errors.append(f"{model}: {e}")
+            add_log(f"{model} error: {str(e)[:80]}", "warn")
 
     # NWS — separate endpoint
     try:
-        nws_data = wethr_get(f"nws.php?station_code={STATION}")
-        from datetime import timedelta
-        utc_now = datetime.utcnow()
-        okc_local = utc_now - timedelta(hours=5)
-        day_start_utc = okc_local.replace(hour=0,minute=0,second=0,microsecond=0) + timedelta(hours=5)
-        day_end_utc = day_start_utc + timedelta(hours=24)
-        versions = {}
+        nws_data = wethr_get(f"observations.php?station_code={STATION}&mode=nws_forecast")
         entries = nws_data if isinstance(nws_data, list) else nws_data.get("forecasts", [])
+        utc_now = datetime.utcnow()
+        versions = {}
         for entry in entries:
-            ver = entry.get("version") or entry.get("forecast_version") or entry.get("run") or "current"
-            vt_str = str(entry.get("valid_time",""))
-            try:
-                vt = datetime.strptime(vt_str[:16], "%Y-%m-%d %H:%M")
-            except:
-                continue
-            if not (day_start_utc <= vt < day_end_utc):
-                continue
-            temp_f = None
-            for k in ["temperature_f","temperature_display","temperature"]:
-                if entry.get(k) is not None:
-                    try: temp_f = round(float(entry[k]),1); break
-                    except: pass
-            if ver not in versions:
-                versions[ver] = []
-            if temp_f is not None:
-                versions[ver].append({"vt": vt, "temp": temp_f})
-        # Find high and current-hour per version
-        nws_versions = {}
+            ver = str(entry.get("version") or entry.get("forecast_version") or entry.get("run") or "current").lower()
+            vt = parse_vt(entry)
+            if not vt: continue
+            temp_f = get_temp(entry)
+            if temp_f is None: continue
+            if ver not in versions: versions[ver] = []
+            versions[ver].append({"vt": vt, "temp": temp_f})
+        nws_out = {}
+        todays_range = today_entries([{"valid_time": v["vt"].strftime("%Y-%m-%d %H:%M"), "temperature_f": v["temp"]} for vals in versions.values() for v in vals])
         for ver, pts in versions.items():
-            if not pts: continue
-            high = max(pts, key=lambda x: x["temp"])["temp"]
-            closest = min(pts, key=lambda x: abs((x["vt"]-utc_now).total_seconds()))
-            nws_versions[ver] = {"high": high, "current_fcst": closest["temp"]}
-        state["nws_versions"] = nws_versions
-        add_log(f"NWS: {len(nws_versions)} versions loaded", "ok")
+            today_pts = [p for p in pts if any(abs((p["vt"] - parse_vt(t)).total_seconds()) < 1800 for t in todays_range)] or pts
+            if not today_pts: continue
+            high = max(today_pts, key=lambda x: x["temp"])["temp"]
+            closest = min(today_pts, key=lambda x: abs((x["vt"] - utc_now).total_seconds()))
+            nws_out[ver] = {"high": high, "current_fcst": closest["temp"]}
+        state["nws_versions"] = nws_out
+        add_log(f"NWS: {len(nws_out)} versions", "ok")
     except Exception as e:
         add_log(f"NWS error: {str(e)[:80]}", "warn")
         state["nws_versions"] = {}
 
-    add_log(f"Done. {len(state['forecasts'])} models loaded.", "ok")
     state["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     state["errors"] = errors
+    add_log(f"Done. {len(state['forecasts'])} models loaded.", "ok")
 
 def background_loop():
     while True:
         try:
             t = threading.Thread(target=fetch_all, daemon=True)
             t.start()
-            t.join(timeout=90)  # give up after 90 seconds
+            t.join(timeout=90)
             if t.is_alive():
                 add_log("Fetch timed out after 90s", "err")
         except Exception as e:
-            add_log(f"Background loop error: {e}", "err")
+            add_log(f"Loop error: {e}", "err")
         time.sleep(REFRESH_SEC)
 
 # ── Routes ────────────────────────────────────────────────────────────────────
-
 @app.route("/api/state")
 def api_state():
     acc = state["accuracy"]
-    rows = []
     models = active_models()
+    rows = []
     for i, model in enumerate(models):
         a = acc.get(model, {})
         fcst = state["forecasts"].get(model, {})
         raw = fcst.get("high")
         corr = a.get("correction")
-        adj = round(raw + float(corr), 1) if raw is not None and corr not in (None, "") else None
+        try: adj = round(float(raw) + float(corr), 1) if raw is not None and corr not in (None,"") else None
+        except: adj = None
         obs_temp = (state["obs"] or {}).get("temperature_display")
         current_fcst = fcst.get("current_fcst")
-        pace = round(float(obs_temp) - float(current_fcst), 1) if obs_temp and current_fcst else None
+        try: pace = round(float(obs_temp) - float(current_fcst), 1) if obs_temp and current_fcst else None
+        except: pace = None
         rows.append({
             "rank": i+1, "model": model,
-            "run": fcst.get("run", "—"),
-            "raw_high": raw,
-            "correction": corr,
-            "adj_high": adj,
-            "pace": pace,
-            "mae": a.get("mae"),
-            "rmse": a.get("rmse"),
+            "run": fcst.get("run","—"),
+            "raw_high": raw, "correction": corr,
+            "adj_high": adj, "pace": pace,
+            "mae": a.get("mae"), "rmse": a.get("rmse"),
             "runs": a.get("runs", {}),
         })
-
-    # MAE-weighted consensus
-    consensus = None
     w_sum, w_total = 0, 0
     for r in rows:
-        mae = r["mae"]
-        adj = r["adj_high"] if r["adj_high"] is not None else r["raw_high"]
-        if mae and adj and float(mae) > 0:
-            w = 1 / float(mae)
-            w_sum += adj * w
-            w_total += w
-    if w_total > 0:
-        consensus = round(w_sum / w_total, 1)
-
+        try:
+            mae = float(r["mae"]); adj = r["adj_high"] if r["adj_high"] is not None else r["raw_high"]
+            if mae > 0 and adj is not None:
+                w = 1/mae; w_sum += adj*w; w_total += w
+        except: pass
+    consensus = round(w_sum/w_total, 1) if w_total > 0 else None
     return jsonify({
-        "obs": state["obs"],
-        "wethr_high": state["wethr_high"],
-        "rows": rows,
-        "consensus": consensus,
-        "last_updated": state["last_updated"],
-        "errors": state["errors"],
-        "log": state["log"][:30],
-        "models": active_models(),
+        "obs": state["obs"], "wethr_high": state["wethr_high"],
+        "rows": rows, "consensus": consensus,
+        "last_updated": state["last_updated"], "errors": state["errors"],
+        "log": state["log"][:30], "models": active_models(),
         "nws_versions": state["nws_versions"],
     })
 
 @app.route("/api/accuracy", methods=["POST"])
 def save_accuracy():
-    data = request.json or {}
-    state["accuracy"] = data
+    state["accuracy"] = request.json or {}
     add_log("Accuracy data updated", "ok")
     return jsonify({"ok": True})
 
@@ -274,169 +227,148 @@ def manual_refresh():
 def index():
     return render_template_string(HTML)
 
-# ── HTML ──────────────────────────────────────────────────────────────────────
-HTML = r"""<!DOCTYPE html>
+HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>KOKC Model Tracker</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&display=swap');
-  *{box-sizing:border-box;margin:0;padding:0}
-  :root{
-    --bg:#080c10;--bg2:#0e1520;--bg3:#0b1118;
-    --border:#1a2535;--text:#c9d4e0;--dim:#4a6080;--dimmer:#2a3a50;
-    --blue:#38bdf8;--green:#4ade80;--yellow:#facc15;--red:#f87171;--purple:#c084fc;
-    --orange:#fb923c;
-  }
-  body{background:var(--bg);color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:13px;min-height:100vh}
-  header{background:var(--bg3);border-bottom:1px solid var(--border);padding:14px 20px;position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
-  .header-left h1{font-size:18px;color:#e8f0f8;letter-spacing:-.5px}
-  .header-left p{font-size:10px;color:var(--dim);letter-spacing:2px;text-transform:uppercase;margin-top:2px}
-  .header-right{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
-  .stat-pill{text-align:right}
-  .stat-pill .label{font-size:9px;color:var(--dim);letter-spacing:2px;text-transform:uppercase}
-  .stat-pill .val{font-size:22px;font-weight:700;line-height:1.1}
-  .stat-pill .sub{font-size:9px;color:var(--dimmer)}
-  .sep{width:1px;height:40px;background:var(--border)}
-  nav{display:flex;gap:2px;background:var(--bg3);border-bottom:1px solid var(--border);padding:0 20px}
-  nav button{background:none;border:none;border-bottom:2px solid transparent;color:var(--dim);padding:10px 16px;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;cursor:pointer;font-family:inherit;transition:color .15s}
-  nav button.active{border-bottom-color:var(--blue);color:var(--blue)}
-  main{padding:20px;max-width:1100px;margin:0 auto}
-  .tab{display:none}.tab.active{display:block}
-  .card{background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:16px 18px;margin-bottom:16px}
-  .card-title{font-size:10px;letter-spacing:2.5px;color:var(--blue);text-transform:uppercase;margin-bottom:12px;display:flex;align-items:center;gap:8px}
-  .stats-row{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
-  .stat-card{background:#0b1520;border:1px solid var(--border);border-radius:6px;padding:12px 16px;flex:1;min-width:120px}
-  .stat-card .lbl{font-size:9px;letter-spacing:2px;color:var(--dim);text-transform:uppercase}
-  .stat-card .v{font-size:22px;font-weight:700;margin-top:4px;line-height:1}
-  .stat-card .s{font-size:10px;color:var(--dimmer);margin-top:3px}
-  table{width:100%;border-collapse:collapse}
-  th{padding:7px 10px;text-align:left;font-size:10px;letter-spacing:1.5px;color:var(--dim);text-transform:uppercase;border-bottom:1px solid var(--border);white-space:nowrap}
-  td{padding:8px 10px;border-bottom:1px solid #111922;white-space:nowrap}
-  tr:nth-child(even) td{background:#0a1018}
-  input[type=number]{background:var(--bg);border:1px solid #1e2e42;border-radius:4px;color:var(--text);padding:4px 8px;font-size:12px;width:70px;font-family:inherit;outline:none}
-  input[type=number]:focus{border-color:var(--blue)}
-  .btn{background:none;border:1px solid var(--blue);color:var(--blue);border-radius:4px;padding:6px 14px;font-size:11px;letter-spacing:1px;cursor:pointer;text-transform:uppercase;font-family:inherit}
-  .btn:hover{background:#38bdf811}
-  .btn-red{border-color:var(--red);color:var(--red)}
-  .btn-red:hover{background:#f8717111}
-  .btn-green{border-color:var(--green);color:var(--green)}
-  .pill{border-radius:3px;padding:2px 7px;font-size:10px;font-weight:600}
-  .pill-green{background:#4ade8022;color:var(--green)}
-  .pill-yellow{background:#facc1522;color:var(--yellow)}
-  .dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:5px}
-  .dot-green{background:var(--green);box-shadow:0 0 6px var(--green)}
-  .dot-red{background:var(--red);box-shadow:0 0 6px var(--red)}
-  .dot-yellow{background:var(--yellow);box-shadow:0 0 6px var(--yellow)}
-  .pace-bar-wrap{display:flex;flex-direction:column;gap:7px}
-  .pace-row{display:flex;align-items:center;gap:10px}
-  .pace-label{width:80px;font-size:11px;color:#8aabcc}
-  .pace-track{width:180px;position:relative;height:12px}
-  .pace-bar{height:10px;border-radius:3px;margin-top:1px}
-  .log-box{background:#060a0e;border-radius:4px;padding:12px;max-height:400px;overflow-y:auto}
-  .log-entry{margin-bottom:5px}
-  .log-t{color:var(--dimmer)}
-  .log-ok{color:var(--green)}
-  .log-err{color:var(--red)}
-  .log-warn{color:var(--yellow)}
-  .log-info{color:var(--dim)}
-  .status-bar{display:flex;align-items:center;gap:8px;font-size:10px;color:var(--dim)}
-  .run-cards{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
-  .run-card{background:#0b1520;border:1px solid var(--border);border-radius:5px;padding:8px 12px;min-width:130px}
-  .run-card .m{font-size:11px;color:#8aabcc;font-weight:600}
-  .run-card .r{font-size:13px;color:var(--blue);margin-top:2px}
-  .run-card .c{font-size:11px;margin-top:2px}
-  @media(max-width:600px){.header-right{gap:8px}.stat-pill .val{font-size:17px}}
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600;700&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#080c10;--bg2:#0e1520;--bg3:#0b1118;--border:#1a2535;
+  --text:#c9d4e0;--dim:#4a6080;--dimmer:#2a3a50;
+  --blue:#38bdf8;--green:#4ade80;--yellow:#facc15;--red:#f87171;--purple:#c084fc;
+}
+body{background:var(--bg);color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:13px;min-height:100vh}
+header{background:var(--bg3);border-bottom:1px solid var(--border);padding:14px 20px;
+  position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px}
+h1{font-size:18px;color:#e8f0f8;letter-spacing:-.5px}
+.sub{font-size:10px;color:var(--dim);letter-spacing:2px;text-transform:uppercase;margin-top:2px}
+.hright{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.sp{width:1px;height:40px;background:var(--border)}
+.stat-pill .lbl{font-size:9px;color:var(--dim);letter-spacing:2px;text-transform:uppercase}
+.stat-pill .val{font-size:22px;font-weight:700;line-height:1.1}
+.stat-pill .sub2{font-size:9px;color:var(--dimmer)}
+nav{display:flex;gap:2px;background:var(--bg3);border-bottom:1px solid var(--border);padding:0 20px}
+nav button{background:none;border:none;border-bottom:2px solid transparent;color:var(--dim);
+  padding:10px 16px;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;
+  cursor:pointer;font-family:inherit;transition:color .15s}
+nav button.active{border-bottom-color:var(--blue);color:var(--blue)}
+main{padding:20px;max-width:1100px;margin:0 auto}
+.tab{display:none}.tab.active{display:block}
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:6px;padding:16px 18px;margin-bottom:16px}
+.ctitle{font-size:10px;letter-spacing:2.5px;color:var(--blue);text-transform:uppercase;margin-bottom:12px}
+.srow{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+.sc{background:#0b1520;border:1px solid var(--border);border-radius:6px;padding:12px 16px;flex:1;min-width:120px}
+.sc .lbl{font-size:9px;letter-spacing:2px;color:var(--dim);text-transform:uppercase}
+.sc .v{font-size:22px;font-weight:700;margin-top:4px;line-height:1}
+.sc .s{font-size:10px;color:var(--dimmer);margin-top:3px}
+table{width:100%;border-collapse:collapse}
+th{padding:7px 10px;text-align:left;font-size:10px;letter-spacing:1.5px;color:var(--dim);
+   text-transform:uppercase;border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:8px 10px;border-bottom:1px solid #111922;white-space:nowrap}
+tr:nth-child(even) td{background:#0a1018}
+input[type=number]{background:var(--bg);border:1px solid #1e2e42;border-radius:4px;
+  color:var(--text);padding:4px 8px;font-size:12px;width:70px;font-family:inherit;outline:none}
+input[type=number]:focus{border-color:var(--blue)}
+.btn{background:none;border:1px solid var(--blue);color:var(--blue);border-radius:4px;
+  padding:6px 14px;font-size:11px;letter-spacing:1px;cursor:pointer;text-transform:uppercase;font-family:inherit}
+.btn-red{border-color:var(--red);color:var(--red)}
+.btn-green{border-color:var(--green);color:var(--green)}
+.dot{width:7px;height:7px;border-radius:50%;display:inline-block;margin-right:5px}
+.dot-green{background:var(--green);box-shadow:0 0 6px var(--green)}
+.dot-red{background:var(--red);box-shadow:0 0 6px var(--red)}
+.dot-yellow{background:var(--yellow);box-shadow:0 0 6px var(--yellow)}
+.pbars{display:flex;flex-direction:column;gap:7px}
+.prow{display:flex;align-items:center;gap:10px}
+.plabel{width:80px;font-size:11px;color:#8aabcc}
+.pbar{height:10px;border-radius:3px}
+.logbox{background:#060a0e;border-radius:4px;padding:12px;max-height:400px;overflow-y:auto}
+.pill-y{background:#facc1522;color:var(--yellow);border-radius:3px;padding:2px 7px;font-size:10px;font-weight:600}
+.pill-g{background:#4ade8022;color:var(--green);border-radius:3px;padding:2px 7px;font-size:10px;font-weight:600}
 </style>
 </head>
 <body>
-
 <header>
-  <div class="header-left">
-    <h1>KOKC · Model Tracker</h1>
-    <p>Oklahoma City Will Rogers World Airport</p>
+  <div>
+    <h1>KOKC &middot; Model Tracker</h1>
+    <div class="sub">Oklahoma City Will Rogers World Airport</div>
   </div>
-  <div class="header-right">
+  <div class="hright">
     <div class="stat-pill">
-      <div class="label">Live Obs</div>
-      <div class="val" id="h-obs" style="color:var(--yellow)">—</div>
-      <div class="sub" id="h-obs-time">awaiting</div>
+      <div class="lbl">Live Obs</div>
+      <div class="val" id="h-obs" style="color:var(--yellow)">--</div>
+      <div class="sub2" id="h-obs-t">awaiting</div>
     </div>
-    <div class="sep"></div>
+    <div class="sp"></div>
     <div class="stat-pill">
-      <div class="label">Wethr High</div>
-      <div class="val" id="h-wh" style="color:var(--green)">—</div>
-      <div class="sub">NWS logic</div>
+      <div class="lbl">Wethr High</div>
+      <div class="val" id="h-wh" style="color:var(--green)">--</div>
+      <div class="sub2">NWS logic</div>
     </div>
-    <div class="sep"></div>
+    <div class="sp"></div>
     <div class="stat-pill">
-      <div class="label">Consensus</div>
-      <div class="val" id="h-con" style="color:var(--blue)">—</div>
-      <div class="sub">MAE-weighted</div>
+      <div class="lbl">Consensus</div>
+      <div class="val" id="h-con" style="color:var(--blue)">--</div>
+      <div class="sub2">MAE-weighted</div>
     </div>
-    <div class="sep"></div>
+    <div class="sp"></div>
     <div style="text-align:right">
-      <div class="status-bar" id="status-bar">
-        <span class="dot dot-yellow" id="status-dot"></span>
-        <span id="status-text">Loading…</span>
+      <div style="display:flex;align-items:center;gap:6px;font-size:10px;color:var(--dim)">
+        <span class="dot dot-yellow" id="sdot"></span><span id="stxt">Loading...</span>
       </div>
-      <div style="font-size:10px;color:var(--dimmer);margin-top:3px">Next: <span id="countdown">5:00</span></div>
-      <button class="btn" style="margin-top:4px;padding:3px 10px;font-size:10px" onclick="manualRefresh()">↺ Now</button>
+      <div style="font-size:10px;color:var(--dimmer);margin-top:3px">Next: <span id="cnt">5:00</span></div>
+      <button class="btn" style="margin-top:4px;padding:3px 10px;font-size:10px" onclick="manualRefresh()">&#8635; NOW</button>
     </div>
   </div>
 </header>
 
 <nav>
-  <button class="active" onclick="showTab('dashboard',this)">📊 Dashboard</button>
-  <button onclick="showTab('entry',this)">☀️ Morning Entry</button>
-  <button onclick="showTab('runs',this)">🕐 Run Accuracy</button>
-  <button onclick="showTab('log',this)">📟 Log</button>
+  <button class="active" onclick="showTab('dashboard',this)">&#128202; Dashboard</button>
+  <button onclick="showTab('entry',this)">&#9728;&#65039; Morning Entry</button>
+  <button onclick="showTab('runs',this)">&#128336; Run Accuracy</button>
+  <button onclick="showTab('log',this)">&#128319; Log</button>
 </nav>
 
 <main>
 
 <!-- DASHBOARD -->
 <div class="tab active" id="tab-dashboard">
-  <div class="stats-row">
-    <div class="stat-card"><div class="lbl">Current Temp</div><div class="v" id="s-obs" style="color:var(--yellow)">—</div><div class="s" id="s-obs-t">awaiting</div></div>
-    <div class="stat-card"><div class="lbl">Wethr High</div><div class="v" id="s-wh" style="color:var(--green)">—</div><div class="s">NWS · trading day</div></div>
-    <div class="stat-card"><div class="lbl">Consensus High</div><div class="v" id="s-con" style="color:var(--blue)">—</div><div class="s">MAE-weighted adj</div></div>
-    <div class="stat-card"><div class="lbl">Models Live</div><div class="v" id="s-mods" style="color:var(--purple)">—</div><div class="s">forecast runs</div></div>
+  <div class="srow">
+    <div class="sc"><div class="lbl">Current Temp</div><div class="v" id="s-obs" style="color:var(--yellow)">--</div><div class="s" id="s-obs-t">awaiting</div></div>
+    <div class="sc"><div class="lbl">Wethr High</div><div class="v" id="s-wh" style="color:var(--green)">--</div><div class="s">NWS trading day</div></div>
+    <div class="sc"><div class="lbl">Consensus High</div><div class="v" id="s-con" style="color:var(--blue)">--</div><div class="s">MAE-weighted adj</div></div>
+    <div class="sc"><div class="lbl">Models Live</div><div class="v" id="s-mods" style="color:var(--purple)">--</div><div class="s">forecast runs</div></div>
   </div>
 
   <div class="card">
-    <div class="card-title">
-      Top 10 Models — Live Forecasts + Accuracy Adjustments
-      <span class="pill pill-yellow" id="acc-badge" style="display:none">→ Enter accuracy in Morning Entry</span>
-      <span class="pill pill-green" id="acc-loaded" style="display:none">Accuracy loaded ✓</span>
+    <div class="ctitle">
+      Top 10 Models &mdash; Live Forecasts + Accuracy Adjustments
+      <span class="pill-y" id="acc-badge" style="display:none">Enter accuracy in Morning Entry</span>
+      <span class="pill-g" id="acc-loaded" style="display:none">Accuracy loaded</span>
     </div>
     <div style="overflow-x:auto">
       <table>
-        <thead><tr>
-          <th>#</th><th>Model</th><th>Run</th><th>Fcst High</th>
-          <th>Correction</th><th>Adj High</th><th>Obs Pace</th><th>MAE</th><th>RMSE</th>
-        </tr></thead>
-        <tbody id="main-table"></tbody>
+        <thead><tr><th>#</th><th>Model</th><th>Run</th><th>Fcst High</th><th>Correction</th><th>Adj High</th><th>Obs Pace</th><th>MAE</th><th>RMSE</th></tr></thead>
+        <tbody id="main-tbody"></tbody>
       </table>
     </div>
   </div>
 
   <div class="card" id="pace-card" style="display:none">
-    <div class="card-title">Model Pacing vs Current Obs (<span id="pace-obs-val">—</span>°F)</div>
-    <div class="pace-bar-wrap" id="pace-bars"></div>
-    <div style="font-size:10px;color:var(--dimmer);margin-top:10px">
-      Pace = current obs minus model's forecast for this hour.
-    </div>
+    <div class="ctitle">Model Pacing vs Current Obs (<span id="pace-obs">--</span>F)</div>
+    <div class="pbars" id="pbars"></div>
+    <div style="font-size:10px;color:var(--dimmer);margin-top:10px">Pace = current obs minus model forecast for this hour</div>
   </div>
 
   <div class="card" id="nws-card" style="display:none">
-    <div class="card-title">🏛 NWS Forecast Versions</div>
+    <div class="ctitle">NWS Forecast Versions</div>
     <div style="overflow-x:auto">
       <table>
         <thead><tr><th>Version</th><th>Fcst High</th><th>Adj High</th><th>Current Fcst</th><th>Obs Pace</th></tr></thead>
-        <tbody id="nws-table"></tbody>
+        <tbody id="nws-tbody"></tbody>
       </table>
     </div>
   </div>
@@ -444,51 +376,32 @@ HTML = r"""<!DOCTYPE html>
 
 <!-- MORNING ENTRY -->
 <div class="tab" id="tab-entry">
-
-  <!-- FAST PATH: JSON paste -->
   <div class="card" style="border-color:#1e3a5f">
-    <div class="card-title">⚡ Fast Import — Paste JSON from Claude</div>
+    <div class="ctitle">Fast Import &mdash; Paste JSON from Claude</div>
     <p style="color:var(--dim);font-size:12px;line-height:1.7;margin-bottom:12px">
-      Each morning: screenshot the accuracy tables → send to Claude → paste the JSON it gives you here → done in seconds.
+      Each morning: screenshot accuracy tables, send to Claude, paste JSON here.
     </p>
-    <textarea id="json-paste" placeholder='Paste JSON here, e.g. {"ARPEGE":{"mae":0.7,"correction":0.3,"rmse":0.8,"runs":{"00Z":{"mae":0.9,"correction":0.2}}},...}'
-      style="width:100%;height:110px;background:#060a0e;border:1px solid #1e3a5f;border-radius:4px;color:#c9d4e0;padding:10px;font-family:inherit;font-size:11px;resize:vertical;outline:none"></textarea>
+    <textarea id="json-paste" placeholder="Paste JSON here..." style="width:100%;height:110px;background:#060a0e;border:1px solid #1e3a5f;border-radius:4px;color:var(--text);padding:10px;font-family:inherit;font-size:11px;resize:vertical;outline:none"></textarea>
     <div style="display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap">
-      <button class="btn" style="border-color:#38bdf8;color:#38bdf8" onclick="loadFromJSON()">⚡ Load JSON</button>
+      <button class="btn" onclick="loadFromJSON()">Load JSON</button>
       <span style="font-size:10px;color:var(--dim)" id="json-status"></span>
     </div>
   </div>
 
-  <!-- MANUAL FALLBACK -->
   <details style="margin-bottom:16px">
-    <summary style="cursor:pointer;color:var(--dim);font-size:11px;letter-spacing:1px;padding:10px 0;list-style:none">
-      ▸ Manual entry (fallback if no Claude available)
-    </summary>
+    <summary style="cursor:pointer;color:var(--dim);font-size:11px;letter-spacing:1px;padding:10px 0;list-style:none">&#9658; Manual entry (fallback)</summary>
     <div style="margin-top:12px">
       <div class="card">
-        <div class="card-title">Overall 7D Accuracy</div>
+        <div class="ctitle">Overall 7D Accuracy</div>
         <div style="overflow-x:auto">
-          <table>
-            <thead><tr><th>Model</th><th>MAE (°F)</th><th>Correction (°F)</th><th>RMSE (°F)</th></tr></thead>
-            <tbody id="acc-overall-table"></tbody>
-          </table>
+          <table><thead><tr><th>Model</th><th>MAE</th><th>Correction</th><th>RMSE</th></tr></thead><tbody id="ov-tbody"></tbody></table>
         </div>
       </div>
       <div class="card">
-        <div class="card-title">Run-Specific Corrections</div>
-        <p style="color:var(--dim);font-size:11px;margin-bottom:12px">Leave blank if a model doesn't run that cycle.</p>
-        <div style="overflow-x:auto">
-          <table id="run-entry-table">
-            <thead>
-              <tr><th>Model</th><th>00Z</th><th>03Z</th><th>06Z</th><th>09Z</th><th>12Z</th><th>15Z</th><th>18Z</th><th>21Z</th></tr>
-              <tr><th style="font-size:9px;color:var(--dimmer)">MAE / Corr</th>
-                <th colspan="8" style="font-size:9px;color:var(--dimmer);text-align:left;padding-left:10px">MAE on top · Correction below</th></tr>
-            </thead>
-            <tbody id="run-entry-body"></tbody>
-          </table>
-        </div>
+        <div class="ctitle">Run-Specific Corrections</div>
+        <div style="overflow-x:auto"><table><thead><tr><th>Model</th><th>00Z</th><th>03Z</th><th>06Z</th><th>09Z</th><th>12Z</th><th>15Z</th><th>18Z</th><th>21Z</th></tr></thead><tbody id="run-tbody"></tbody></table></div>
         <div style="margin-top:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-          <button class="btn btn-green" onclick="saveAccuracy()">💾 Save</button>
+          <button class="btn btn-green" onclick="saveAccuracy()">Save</button>
           <button class="btn btn-red" onclick="clearAccuracy()">Clear All</button>
           <span style="font-size:10px;color:var(--dim)" id="save-status"></span>
         </div>
@@ -496,382 +409,327 @@ HTML = r"""<!DOCTYPE html>
     </div>
   </details>
 
-  <!-- Current loaded data preview -->
   <div class="card" id="acc-preview" style="display:none">
-    <div class="card-title">Currently Loaded Accuracy Data</div>
-    <div style="overflow-x:auto">
-      <table>
-        <thead><tr><th>Model</th><th>MAE</th><th>Correction</th><th>RMSE</th><th>Runs with data</th></tr></thead>
-        <tbody id="acc-preview-body"></tbody>
-      </table>
-    </div>
+    <div class="ctitle">Currently Loaded</div>
+    <div style="overflow-x:auto"><table><thead><tr><th>Model</th><th>MAE</th><th>Correction</th><th>RMSE</th><th>Runs</th></tr></thead><tbody id="prev-tbody"></tbody></table></div>
     <div style="margin-top:10px;display:flex;gap:10px;align-items:center">
       <button class="btn btn-red" onclick="clearAccuracy()">Clear All</button>
       <span style="font-size:10px;color:var(--dim)" id="acc-loaded-time"></span>
     </div>
   </div>
-
 </div>
 
 <!-- RUN ACCURACY -->
 <div class="tab" id="tab-runs">
   <div class="card">
-    <div class="card-title">Run-Specific Accuracy — Entered Values</div>
-    <div style="overflow-x:auto"><table>
-      <thead><tr><th>Model</th><th>00Z</th><th>03Z</th><th>06Z</th><th>09Z</th><th>12Z</th><th>15Z</th><th>18Z</th><th>21Z</th></tr></thead>
-      <tbody id="run-view-body"></tbody>
-    </table></div>
-    <div class="card-title" style="margin-top:20px">Current Live Run per Model</div>
-    <div class="run-cards" id="run-cards"></div>
+    <div class="ctitle">Run-Specific Accuracy</div>
+    <div style="overflow-x:auto"><table><thead><tr><th>Model</th><th>00Z</th><th>03Z</th><th>06Z</th><th>09Z</th><th>12Z</th><th>15Z</th><th>18Z</th><th>21Z</th></tr></thead><tbody id="runview-tbody"></tbody></table></div>
+    <div class="ctitle" style="margin-top:20px">Current Run per Model</div>
+    <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px" id="run-cards"></div>
   </div>
 </div>
 
 <!-- LOG -->
 <div class="tab" id="tab-log">
   <div class="card">
-    <div class="card-title">Fetch Log</div>
-    <div class="log-box" id="log-box"><div style="color:var(--dimmer)">No entries yet.</div></div>
+    <div class="ctitle">Fetch Log</div>
+    <div class="logbox" id="logbox"><div style="color:var(--dimmer)">No entries yet.</div></div>
   </div>
 </div>
 
 </main>
 
 <script>
-const ALL_KNOWN_MODELS = ["ARPEGE","HRRR","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NWS","NAM-MOS","NBM",
-  "NAM4KM","GFS","ICON","GFS-MOS","ECMWF-HRES","GEFS","JMA","RDPS","SREF","NBM-ENS"];
-let MODELS = ALL_KNOWN_MODELS.slice(0,10); // updated dynamically from server
-const RUNS = ["00Z","03Z","06Z","09Z","12Z","15Z","18Z","21Z"];
-let accData = JSON.parse(localStorage.getItem("kokc_acc") || "{}");
-// Restore model order from last saved accuracy data
-if(Object.keys(accData).length) MODELS = Object.keys(accData);
-let countdown = 300;
-let countdownTimer;
+var MODELS = [];
+var accData = {};
+try { accData = JSON.parse(localStorage.getItem("kokc_acc") || "{}"); } catch(e){}
+if(Object.keys(accData).length) MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
+var countdown = 300;
+var countdownTimer;
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
-function fmt1(v){ return (v==null||v==="") ? "—" : Number(v).toFixed(1); }
-function fmtCorr(v){
-  if(v==null||v==="") return "—";
-  const n=Number(v); return (n>=0?"+":"")+n.toFixed(1)+"°";
+var MANUAL_RUNS = ["00Z","03Z","06Z","09Z","12Z","15Z","18Z","21Z"];
+
+function fmt1(v){ return (v==null||v==="") ? "--" : Number(v).toFixed(1); }
+function fmtC(v){
+  if(v==null||v==="") return "--";
+  var n=Number(v); return (n>=0?"+":"")+n.toFixed(1)+"F";
 }
 function corrColor(v){
-  if(v==null||v==="") return "#4a6080";
-  return Number(v)>0?"#60a5fa":Number(v)<0?"#f87171":"#4a6080";
+  if(v==null||v==="") return "var(--dim)";
+  return Number(v)>0?"#60a5fa":Number(v)<0?"#f87171":"var(--dim)";
 }
 function maeColor(v){
-  if(v==null||v==="") return "#4a6080";
-  const n=Number(v); return n<=1?"#4ade80":n<=2?"#facc15":"#f87171";
+  if(v==null||v==="") return "var(--dim)";
+  var n=Number(v); return n<=1?"var(--green)":n<=2?"var(--yellow)":"var(--red)";
 }
 function paceColor(v){
-  const n=Math.abs(Number(v)); return n<=1?"#4ade80":n<=3?"#facc15":"#f87171";
+  var n=Math.abs(Number(v)); return n<=1?"var(--green)":n<=3?"var(--yellow)":"var(--red)";
 }
 
-// ── Tab switching ─────────────────────────────────────────────────────────────
-function showTab(id, btn){
-  document.querySelectorAll(".tab").forEach(t=>t.classList.remove("active"));
-  document.querySelectorAll("nav button").forEach(b=>b.classList.remove("active"));
+function showTab(id,btn){
+  document.querySelectorAll(".tab").forEach(function(t){t.classList.remove("active");});
+  document.querySelectorAll("nav button").forEach(function(b){b.classList.remove("active");});
   document.getElementById("tab-"+id).classList.add("active");
   btn.classList.add("active");
 }
 
-// ── Build entry forms ─────────────────────────────────────────────────────────
-function buildEntryForms(){
-  // Overall
-  const tbody = document.getElementById("acc-overall-table");
-  tbody.innerHTML = MODELS.map((m,i)=>`
-    <tr style="${i%2?"background:#0a1018":""}">
-      <td style="color:#e8f0f8;font-weight:600">${m}</td>
-      <td><input type="number" step="0.1" placeholder="0.0" id="ov-mae-${m}" value="${accData[m]?.mae||""}"></td>
-      <td><input type="number" step="0.1" placeholder="0.0" id="ov-corr-${m}" value="${accData[m]?.correction||""}"></td>
-      <td><input type="number" step="0.1" placeholder="0.0" id="ov-rmse-${m}" value="${accData[m]?.rmse||""}"></td>
-    </tr>`).join("");
-
-  // Run-specific
-  const rbody = document.getElementById("run-entry-body");
-  rbody.innerHTML = MODELS.map((m,i)=>`
-    <tr style="${i%2?"background:#0a1018":""}">
-      <td style="color:#8aabcc;font-weight:600">${m}</td>
-      ${RUNS.map(r=>`
-        <td style="padding:5px 6px">
-          <div style="display:flex;flex-direction:column;gap:3px">
-            <input type="number" step="0.1" placeholder="MAE" style="width:56px;font-size:11px"
-              id="run-mae-${m}-${r}" value="${accData[m]?.runs?.[r]?.mae||""}">
-            <input type="number" step="0.1" placeholder="Corr" style="width:56px;font-size:11px"
-              id="run-corr-${m}-${r}" value="${accData[m]?.runs?.[r]?.correction||""}">
-          </div>
-        </td>`).join("")}
-    </tr>`).join("");
-}
-
-function loadFromJSON(){
-  const raw = document.getElementById("json-paste").value.trim();
-  const status = document.getElementById("json-status");
-  if(!raw){ status.style.color="var(--red)"; status.textContent="Nothing to paste."; return; }
-  try {
-    const parsed = JSON.parse(raw);
-    // Validate it has at least one known model
-    const known = MODELS.filter(m => parsed[m]);
-    if(known.length === 0){ status.style.color="var(--red)"; status.textContent="No recognisable models found in JSON."; return; }
-    accData = parsed;
-    MODELS = Object.keys(parsed); // update model list immediately
-    localStorage.setItem("kokc_acc", JSON.stringify(parsed));
-    localStorage.setItem("kokc_acc_time", new Date().toLocaleString());
-    fetch("/api/accuracy",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(parsed)})
-      .then(()=>{
-        status.style.color="var(--green)";
-        status.textContent = `✓ Loaded ${known.length} models at ${new Date().toLocaleTimeString()}`;
-        document.getElementById("json-paste").value = "";
-        buildEntryForms();
-        renderAccPreview();
-        poll();
-      })
-      .catch(()=>{ status.style.color="var(--red)"; status.textContent="Server save failed."; });
-  } catch(e) {
-    status.style.color="var(--red)";
-    status.textContent = "Invalid JSON: " + e.message;
-  }
-}
-
-function renderAccPreview(){
-  const hasAny = MODELS.some(m => accData[m]?.mae);
-  const preview = document.getElementById("acc-preview");
-  if(!hasAny){ preview.style.display="none"; return; }
-  preview.style.display="block";
-  const t = localStorage.getItem("kokc_acc_time");
-  if(t) document.getElementById("acc-loaded-time").textContent = "Loaded: "+t;
-  document.getElementById("acc-preview-body").innerHTML = MODELS.map((m,i)=>{
-    const a = accData[m]||{};
-    const runsWithData = Object.entries(a.runs||{}).filter(([,v])=>v.mae||v.correction).map(([k])=>k).join(", ")||"—";
-    return `<tr style="${i%2?"background:#0a1018":""}">
-      <td style="color:#e8f0f8;font-weight:600">${m}</td>
-      <td style="color:${maeColor(a.mae)}">${a.mae?fmt1(a.mae)+"°":"—"}</td>
-      <td style="color:${corrColor(a.correction)}">${a.correction!=null&&a.correction!==""?fmtCorr(a.correction):"—"}</td>
-      <td style="color:#4a6080">${a.rmse?fmt1(a.rmse)+"°":"—"}</td>
-      <td style="color:#4a6080;font-size:11px">${runsWithData}</td>
-    </tr>`;
+function buildForms(){
+  var ov = document.getElementById("ov-tbody");
+  if(!ov) return;
+  var mods = MODELS.length ? MODELS : ["HRRR","ARPEGE","NAM","UKMO","LAV-MOS","RAP","GEM-GDPS","NAM-MOS","NBM","NAM4KM"];
+  ov.innerHTML = mods.map(function(m,i){
+    var a = accData[m]||{};
+    var bg = i%2?"background:#0a1018":"";
+    return '<tr style="'+bg+'"><td style="color:#e8f0f8;font-weight:600">'+m+'</td>'
+      +'<td><input type="number" step="0.1" placeholder="0.0" id="ov-mae-'+m+'" value="'+(a.mae||"")+'"></td>'
+      +'<td><input type="number" step="0.1" placeholder="0.0" id="ov-corr-'+m+'" value="'+(a.correction||"")+'"></td>'
+      +'<td><input type="number" step="0.1" placeholder="0.0" id="ov-rmse-'+m+'" value="'+(a.rmse||"")+'"></td></tr>';
+  }).join("");
+  var rb = document.getElementById("run-tbody");
+  rb.innerHTML = mods.map(function(m,i){
+    var a = accData[m]||{};
+    var bg = i%2?"background:#0a1018":"";
+    var cells = MANUAL_RUNS.map(function(r){
+      var rd = (a.runs||{})[r]||{};
+      return '<td style="padding:5px 6px"><div style="display:flex;flex-direction:column;gap:3px">'
+        +'<input type="number" step="0.1" placeholder="MAE" style="width:56px;font-size:11px" id="rm-mae-'+m+'-'+r+'" value="'+(rd.mae||"")+'"><br>'
+        +'<input type="number" step="0.1" placeholder="Corr" style="width:56px;font-size:11px" id="rm-corr-'+m+'-'+r+'" value="'+(rd.correction||"")+'"></div></td>';
+    }).join("");
+    return '<tr style="'+bg+'"><td style="color:#8aabcc;font-weight:600">'+m+'</td>'+cells+'</tr>';
   }).join("");
 }
 
+function loadFromJSON(){
+  var raw = document.getElementById("json-paste").value.trim();
+  var status = document.getElementById("json-status");
+  if(!raw){ status.style.color="var(--red)"; status.textContent="Nothing to paste."; return; }
+  try {
+    var parsed = JSON.parse(raw);
+    var keys = Object.keys(parsed);
+    if(!keys.length){ status.style.color="var(--red)"; status.textContent="No models found."; return; }
+    accData = parsed;
+    MODELS = keys.filter(function(m){ return m !== "NWS"; });
+    localStorage.setItem("kokc_acc", JSON.stringify(parsed));
+    localStorage.setItem("kokc_acc_time", new Date().toLocaleString());
+    fetch("/api/accuracy",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(parsed)})
+      .then(function(){
+        status.style.color="var(--green)";
+        status.textContent = "Loaded "+keys.length+" models at "+new Date().toLocaleTimeString();
+        document.getElementById("json-paste").value="";
+        buildForms(); renderPreview(); poll();
+      }).catch(function(){ status.style.color="var(--red)"; status.textContent="Server save failed."; });
+  } catch(e) {
+    status.style.color="var(--red)"; status.textContent="Invalid JSON: "+e.message;
+  }
+}
+
 function saveAccuracy(){
-  const data = {};
-  MODELS.forEach(m=>{
+  var mods = MODELS.length ? MODELS : [];
+  var data = {};
+  mods.forEach(function(m){
     data[m] = {
-      mae: document.getElementById(`ov-mae-${m}`)?.value || "",
-      correction: document.getElementById(`ov-corr-${m}`)?.value || "",
-      rmse: document.getElementById(`ov-rmse-${m}`)?.value || "",
+      mae: document.getElementById("ov-mae-"+m) ? document.getElementById("ov-mae-"+m).value : "",
+      correction: document.getElementById("ov-corr-"+m) ? document.getElementById("ov-corr-"+m).value : "",
+      rmse: document.getElementById("ov-rmse-"+m) ? document.getElementById("ov-rmse-"+m).value : "",
       runs: {}
     };
-    RUNS.forEach(r=>{
+    MANUAL_RUNS.forEach(function(r){
+      var mae_el = document.getElementById("rm-mae-"+m+"-"+r);
+      var corr_el = document.getElementById("rm-corr-"+m+"-"+r);
       data[m].runs[r] = {
-        mae: document.getElementById(`run-mae-${m}-${r}`)?.value || "",
-        correction: document.getElementById(`run-corr-${m}-${r}`)?.value || ""
+        mae: mae_el ? mae_el.value : "",
+        correction: corr_el ? corr_el.value : ""
       };
     });
   });
   accData = data;
   localStorage.setItem("kokc_acc", JSON.stringify(data));
   fetch("/api/accuracy",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)})
-    .then(()=>{ document.getElementById("save-status").textContent = "✓ Saved at "+new Date().toLocaleTimeString(); })
-    .catch(()=>{ document.getElementById("save-status").textContent = "⚠ Save failed"; });
+    .then(function(){ document.getElementById("save-status").textContent="Saved "+new Date().toLocaleTimeString(); });
 }
 
 function clearAccuracy(){
   if(!confirm("Clear all accuracy data?")) return;
-  accData = {};
-  localStorage.removeItem("kokc_acc");
-  localStorage.removeItem("kokc_acc_time");
+  accData = {}; MODELS = [];
+  localStorage.removeItem("kokc_acc"); localStorage.removeItem("kokc_acc_time");
   fetch("/api/accuracy",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})});
-  buildEntryForms();
-  renderAccPreview();
-  document.getElementById("save-status").textContent = "Cleared";
+  buildForms(); renderPreview();
+  document.getElementById("save-status").textContent="Cleared";
 }
 
-// ── Render state ──────────────────────────────────────────────────────────────
+function renderPreview(){
+  var hasAny = Object.keys(accData).some(function(m){ return accData[m] && accData[m].mae; });
+  var el = document.getElementById("acc-preview");
+  document.getElementById("acc-badge").style.display = hasAny ? "none" : "inline";
+  document.getElementById("acc-loaded").style.display = hasAny ? "inline" : "none";
+  if(!hasAny){ el.style.display="none"; return; }
+  el.style.display="block";
+  var t = localStorage.getItem("kokc_acc_time");
+  if(t) document.getElementById("acc-loaded-time").textContent="Loaded: "+t;
+  var mods = Object.keys(accData);
+  document.getElementById("prev-tbody").innerHTML = mods.map(function(m,i){
+    var a = accData[m]||{};
+    var runs = Object.entries(a.runs||{}).filter(function(e){ return e[1].mae||e[1].correction; }).map(function(e){ return e[0]; }).join(", ")||"--";
+    var bg = i%2?"background:#0a1018":"";
+    return '<tr style="'+bg+'">'
+      +'<td style="color:#e8f0f8;font-weight:600">'+m+'</td>'
+      +'<td style="color:'+maeColor(a.mae)+'">'+(a.mae?fmt1(a.mae)+"F":"--")+'</td>'
+      +'<td style="color:'+corrColor(a.correction)+'">'+(a.correction!=null&&a.correction!==""?fmtC(a.correction):"--")+'</td>'
+      +'<td style="color:var(--dim)">'+(a.rmse?fmt1(a.rmse)+"F":"--")+'</td>'
+      +'<td style="color:var(--dim);font-size:11px">'+runs+'</td></tr>';
+  }).join("");
+}
+
 function render(data){
-  if(data.models && data.models.length) MODELS = data.models;
-  const obs = data.obs;
-  const wh = data.wethr_high;
-  const rows = data.rows;
-  const con = data.consensus;
+  if(data.models && data.models.length) MODELS = data.models.filter(function(m){ return m!=="NWS"; });
+  var obs = data.obs;
+  var wh = data.wethr_high;
+  var rows = data.rows||[];
+  var con = data.consensus;
 
-  // Header
   if(obs){
-    const temp = obs.temperature_display;
-    document.getElementById("h-obs").textContent = temp+"°F";
-    document.getElementById("s-obs").textContent = temp+"°";
-    document.getElementById("h-obs-time").textContent = (obs.observation_time||"").slice(11,16)||"—";
-    document.getElementById("s-obs-t").textContent = (obs.observation_time||"").slice(11,16)||"—";
+    var t = obs.temperature_display;
+    document.getElementById("h-obs").textContent = t+"F";
+    document.getElementById("s-obs").textContent = t+"F";
+    var ot = (obs.observation_time||"").slice(11,16)||"--";
+    document.getElementById("h-obs-t").textContent = ot;
+    document.getElementById("s-obs-t").textContent = ot;
+    document.getElementById("pace-obs").textContent = t;
   }
-  if(wh){
-    document.getElementById("h-wh").textContent = wh.wethr_high+"°F";
-    document.getElementById("s-wh").textContent = wh.wethr_high+"°";
-  }
-  if(con){
-    document.getElementById("h-con").textContent = con+"°F";
-    document.getElementById("s-con").textContent = con+"°";
-  }
-
-  // Models live count
-  const liveCt = rows.filter(r=>r.raw_high!=null).length;
-  document.getElementById("s-mods").textContent = liveCt+"/"+MODELS.length;
-
-  // Accuracy badge
-  const hasAcc = rows.some(r=>r.mae!=null&&r.mae!=="");
-  document.getElementById("acc-badge").style.display = hasAcc?"none":"inline";
-  document.getElementById("acc-loaded").style.display = hasAcc?"inline":"none";
+  if(wh){ document.getElementById("h-wh").textContent=wh.wethr_high+"F"; document.getElementById("s-wh").textContent=wh.wethr_high+"F"; }
+  if(con){ document.getElementById("h-con").textContent=con+"F"; document.getElementById("s-con").textContent=con+"F"; }
+  document.getElementById("s-mods").textContent = rows.filter(function(r){ return r.raw_high!=null; }).length+"/"+rows.length;
 
   // Main table
-  document.getElementById("main-table").innerHTML = rows.map(r=>`
-    <tr>
-      <td style="color:#4a6080">#${r.rank}</td>
-      <td style="color:#e8f0f8;font-weight:600">${r.model}</td>
-      <td style="color:#4a6080;font-size:11px">${r.run||"—"}</td>
-      <td style="color:var(--yellow)">${r.raw_high!=null?r.raw_high+"°":"—"}</td>
-      <td style="color:${corrColor(r.correction)}">${fmtCorr(r.correction)}</td>
-      <td style="color:var(--green);font-weight:600">${r.adj_high!=null?r.adj_high+"°":"—"}</td>
-      <td style="color:${r.pace!=null?paceColor(r.pace):"#1e2e42"}">${r.pace!=null?(r.pace>=0?"+":"")+r.pace+"°":"—"}</td>
-      <td style="color:${maeColor(r.mae)}">${r.mae&&r.mae!=""?fmt1(r.mae)+"°":"—"}</td>
-      <td style="color:#4a6080">${r.rmse&&r.rmse!=""?fmt1(r.rmse)+"°":"—"}</td>
-    </tr>`).join("");
+  document.getElementById("main-tbody").innerHTML = rows.map(function(r,i){
+    var bg = i%2?"background:#0a1018":"";
+    return '<tr style="'+bg+'">'
+      +'<td style="color:var(--dim)">#'+r.rank+'</td>'
+      +'<td style="color:#e8f0f8;font-weight:600">'+r.model+'</td>'
+      +'<td style="color:var(--dim);font-size:11px">'+(r.run||"--")+'</td>'
+      +'<td style="color:var(--yellow)">'+(r.raw_high!=null?r.raw_high+"F":"--")+'</td>'
+      +'<td style="color:'+corrColor(r.correction)+'">'+(r.correction!=null&&r.correction!==""?fmtC(r.correction):"--")+'</td>'
+      +'<td style="color:var(--green);font-weight:600">'+(r.adj_high!=null?r.adj_high+"F":"--")+'</td>'
+      +'<td style="color:'+(r.pace!=null?paceColor(r.pace):"#1e2e42")+'">'+(r.pace!=null?(r.pace>=0?"+":"")+r.pace+"F":"--")+'</td>'
+      +'<td style="color:'+maeColor(r.mae)+'">'+(r.mae?fmt1(r.mae)+"F":"--")+'</td>'
+      +'<td style="color:var(--dim)">'+(r.rmse?fmt1(r.rmse)+"F":"--")+'</td></tr>';
+  }).join("");
 
   // Pacing bars
-  const paceRows = rows.filter(r=>r.pace!=null);
+  var paceRows = rows.filter(function(r){ return r.pace!=null; });
   if(paceRows.length && obs){
     document.getElementById("pace-card").style.display="block";
-    document.getElementById("pace-obs-val").textContent = obs.temperature_display;
-    document.getElementById("pace-bars").innerHTML = paceRows.map(r=>{
-      const p = Number(r.pace);
-      const w = Math.min(Math.abs(p)*14,140);
-      const col = p>=0?"#4ade80":"#f87171";
-      return `<div class="pace-row">
-        <div class="pace-label">${r.model}</div>
-        <div class="pace-track">
-          <div class="pace-bar" style="width:${w}px;background:${col}33;border:1px solid ${col}"></div>
-        </div>
-        <span style="font-size:11px;color:${paceColor(r.pace)};font-weight:600">${p>=0?"+":""}${r.pace}°</span>
-      </div>`;
+    document.getElementById("pbars").innerHTML = paceRows.map(function(r){
+      var p=Number(r.pace); var w=Math.min(Math.abs(p)*14,140);
+      var col=p>=0?"var(--green)":"var(--red)";
+      return '<div class="prow"><div class="plabel">'+r.model+'</div>'
+        +'<div style="width:160px"><div class="pbar" style="width:'+w+'px;background:'+col+'33;border:1px solid '+col+'"></div></div>'
+        +'<span style="font-size:11px;color:'+paceColor(r.pace)+';font-weight:600">'+(p>=0?"+":"")+r.pace+'F</span></div>';
     }).join("");
   }
 
-  // Run view tab
-  document.getElementById("run-view-body").innerHTML = rows.map((r,i)=>`
-    <tr style="${i%2?"background:#0a1018":""}">
-      <td style="color:#e8f0f8;font-weight:600">${r.model}</td>
-      ${RUNS.map(run=>{
-        const rd = r.runs?.[run]||{};
-        const hasMae = rd.mae!=null&&rd.mae!=="";
-        const hasCorr = rd.correction!=null&&rd.correction!=="";
-        return `<td style="text-align:center">${(hasMae||hasCorr)?`
-          <div style="line-height:1.8">
-            ${hasMae?`<div style="color:${maeColor(rd.mae)}">${fmt1(rd.mae)}°</div>`:""}
-            ${hasCorr?`<div style="color:${corrColor(rd.correction)}">${fmtCorr(rd.correction)}</div>`:""}
-          </div>`:`<span style="color:#1e2e42">—</span>`}</td>`;
-      }).join("")}
-    </tr>`).join("");
+  // NWS versions
+  var nws = data.nws_versions||{};
+  var nwsKeys = Object.keys(nws);
+  var nwsCard = document.getElementById("nws-card");
+  if(nwsKeys.length){
+    nwsCard.style.display="block";
+    var nwsAcc = accData["NWS"]||{};
+    var nwsCorr = (nwsAcc.correction!=null&&nwsAcc.correction!=="") ? Number(nwsAcc.correction) : null;
+    var obsT = obs ? Number(obs.temperature_display) : null;
+    nwsKeys.sort(function(a,b){
+      if(a==="current") return -1; if(b==="current") return 1;
+      return (parseInt(b.replace("v",""))||0)-(parseInt(a.replace("v",""))||0);
+    });
+    document.getElementById("nws-tbody").innerHTML = nwsKeys.map(function(ver,i){
+      var v = nws[ver];
+      var adj = (v.high!=null&&nwsCorr!=null) ? (v.high+nwsCorr).toFixed(1) : null;
+      var pace = (obsT!=null&&v.current_fcst!=null) ? (obsT-v.current_fcst).toFixed(1) : null;
+      var vc = ver==="current"?"var(--green)":"var(--blue)";
+      var vl = ver==="current"?"Current":ver.toUpperCase();
+      var pc = pace!=null?paceColor(pace):"#1e2e42";
+      var ps = pace!=null?(Number(pace)>=0?"+":"")+pace+"F":"--";
+      var bg = i%2?"background:#0a1018":"";
+      return '<tr style="'+bg+'">'
+        +'<td style="color:'+vc+';font-weight:600">'+vl+'</td>'
+        +'<td style="color:var(--yellow)">'+(v.high!=null?v.high+"F":"--")+'</td>'
+        +'<td style="color:var(--green)">'+(adj?adj+"F":"--")+'</td>'
+        +'<td style="color:#94a3b8">'+(v.current_fcst!=null?v.current_fcst+"F":"--")+'</td>'
+        +'<td style="color:'+pc+'">'+ps+'</td></tr>';
+    }).join("");
+  } else {
+    nwsCard.style.display="none";
+  }
+
+  // Run accuracy tab
+  document.getElementById("runview-tbody").innerHTML = rows.map(function(r,i){
+    var bg = i%2?"background:#0a1018":"";
+    var cells = MANUAL_RUNS.map(function(run){
+      var rd = (r.runs||{})[run]||{};
+      var has = rd.mae||rd.correction;
+      return '<td style="text-align:center">'+(has
+        ?'<div style="line-height:1.8">'+(rd.mae?'<div style="color:'+maeColor(rd.mae)+'">'+fmt1(rd.mae)+'F</div>':'')+
+          (rd.correction!=null&&rd.correction!==""?'<div style="color:'+corrColor(rd.correction)+'">'+fmtC(rd.correction)+'</div>':'')+'</div>'
+        :'<span style="color:#1e2e42">--</span>')+'</td>';
+    }).join("");
+    return '<tr style="'+bg+'"><td style="color:#e8f0f8;font-weight:600">'+r.model+'</td>'+cells+'</tr>';
+  }).join("");
 
   // Run cards
-  document.getElementById("run-cards").innerHTML = rows.map(r=>{
-    const runKey = (r.run||"").replace(/[^0-9]/g,"").slice(0,2)+"Z";
-    const rd = r.runs?.[runKey]||{};
-    const hasCorr = rd.correction!=null&&rd.correction!=="";
-    return `<div class="run-card">
-      <div class="m">${r.model}</div>
-      <div class="r">${r.run||"—"}</div>
-      ${hasCorr?`<div class="c" style="color:${corrColor(rd.correction)}">Corr: ${fmtCorr(rd.correction)}</div>`
-               :`<div class="c" style="color:#2a4060">No run corr</div>`}
-    </div>`;
+  document.getElementById("run-cards").innerHTML = rows.map(function(r){
+    var runKey = r.run ? r.run.replace(/[^0-9]/g,"").slice(0,2)+"Z" : "";
+    var rd = (r.runs||{})[runKey]||{};
+    var hasC = rd.correction!=null&&rd.correction!=="";
+    return '<div style="background:#0b1520;border:1px solid var(--border);border-radius:5px;padding:8px 12px;min-width:120px">'
+      +'<div style="font-size:11px;color:#8aabcc;font-weight:600">'+r.model+'</div>'
+      +'<div style="font-size:13px;color:var(--blue);margin-top:2px">'+(r.run||"--")+'</div>'
+      +(hasC?'<div style="font-size:11px;color:'+corrColor(rd.correction)+';margin-top:2px">Corr: '+fmtC(rd.correction)+'</div>'
+             :'<div style="font-size:10px;color:#2a4060;margin-top:2px">No run corr</div>')
+      +'</div>';
   }).join("");
 
   // Log
   if(data.log&&data.log.length){
-    document.getElementById("log-box").innerHTML = data.log.map(e=>
-      `<div class="log-entry"><span class="log-t">[${e.t}]</span> <span class="log-${e.level}">${e.msg}</span></div>`
-    ).join("");
-  }
-
-  // NWS versions
-  const nws = data.nws_versions || {};
-  const nwsKeys = Object.keys(nws);
-  const nwsCard = document.getElementById("nws-card");
-  if(nwsKeys.length){
-    nwsCard.style.display = "block";
-    const nwsAcc = (accData["NWS"] || {});
-    const nwsCorr = nwsAcc.correction != null && nwsAcc.correction !== "" ? Number(nwsAcc.correction) : null;
-    const obsTemp = obs ? Number(obs.temperature_display) : null;
-    // Sort: current first, then V1,V2... descending
-    const sorted = nwsKeys.sort((a,b)=>{
-      if(a==="current") return -1; if(b==="current") return 1;
-      return parseInt(b.replace("V",""))||0 - parseInt(a.replace("V",""))||0;
-    });
-    document.getElementById("nws-table").innerHTML = sorted.map((ver,i)=>{
-      const v = nws[ver];
-      const adj = v.high != null && nwsCorr != null ? (v.high + nwsCorr).toFixed(1) : null;
-      const pace = obsTemp && v.current_fcst != null ? (obsTemp - v.current_fcst).toFixed(1) : null;
-      const vc = ver === "current" ? "var(--green)" : "var(--blue)";
-      const vl = ver === "current" ? "Current" : ver;
-      const pc = pace != null ? paceColor(pace) : "#1e2e42";
-      const ps = pace != null ? (Number(pace)>=0?"+":"")+pace+"°" : "—";
-      const bg = i%2 ? "background:#0a1018" : "";
-      return '<tr style="'+bg+'"><td style="color:'+vc+';font-weight:600">'+vl+'</td>'
-        +'<td style="color:var(--yellow)">'+(v.high!=null?v.high+"°":"—")+'</td>'
-        +'<td style="color:var(--green)">'+(adj?adj+"°":"—")+'</td>'
-        +'<td style="color:#94a3b8">'+(v.current_fcst!=null?v.current_fcst+"°":"—")+'</td>'
-        +'<td style="color:'+pc+'">'+ps+'</td></tr>';
+    document.getElementById("logbox").innerHTML = data.log.map(function(e){
+      var col = e.level==="ok"?"var(--green)":e.level==="err"?"var(--red)":e.level==="warn"?"var(--yellow)":"var(--dim)";
+      return '<div style="margin-bottom:5px"><span style="color:var(--dimmer)">['+e.t+']</span> <span style="color:'+col+'">'+e.msg+'</span></div>';
     }).join("");
-  } else {
-    nwsCard.style.display = "none";
   }
 
   // Status
-  const dot = document.getElementById("status-dot");
-  const txt = document.getElementById("status-text");
-  dot.className = "dot " + (data.errors?.length ? "dot-yellow" : "dot-green");
-  txt.textContent = data.last_updated ? "Updated "+data.last_updated.slice(11,16) : "Live";
+  document.getElementById("sdot").className = "dot "+(data.errors&&data.errors.length?"dot-yellow":"dot-green");
+  document.getElementById("stxt").textContent = data.last_updated?"Updated "+data.last_updated.slice(11,16):"Live";
 }
 
-// ── Polling ───────────────────────────────────────────────────────────────────
 function poll(){
-  // Push saved accuracy to server on load
   if(Object.keys(accData).length){
     fetch("/api/accuracy",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)});
   }
-  fetch("/api/state").then(r=>r.json()).then(render).catch(console.error);
+  fetch("/api/state").then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error(e); });
 }
 
 function manualRefresh(){
   fetch("/api/refresh",{method:"POST"});
-  countdown = 300;
-  setTimeout(poll, 3000);
+  countdown=300;
+  setTimeout(poll,3000);
 }
 
 function startCountdown(){
   clearInterval(countdownTimer);
-  countdown = 300;
-  countdownTimer = setInterval(()=>{
-    countdown = Math.max(0, countdown-1);
-    const m = Math.floor(countdown/60);
-    const s = String(countdown%60).padStart(2,"0");
-    document.getElementById("countdown").textContent = m+":"+s;
-    if(countdown === 0){ poll(); countdown = 300; }
-  }, 1000);
+  countdown=300;
+  countdownTimer=setInterval(function(){
+    countdown=Math.max(0,countdown-1);
+    var m=Math.floor(countdown/60); var s=String(countdown%60).padStart(2,"0");
+    document.getElementById("cnt").textContent=m+":"+s;
+    if(countdown===0){ poll(); countdown=300; }
+  },1000);
 }
 
-// ── Init ──────────────────────────────────────────────────────────────────────
-buildEntryForms();
-renderAccPreview();
-poll();
-startCountdown();
-setInterval(poll, 300000);
+buildForms(); renderPreview(); poll(); startCountdown(); setInterval(poll,300000);
 </script>
 </body>
 </html>
 """
-
-if os.path.exists("accuracy.json"):
-    try:
-        with open("accuracy.json") as f:
-            state["accuracy"] = json.load(f)
-    except Exception:
-        pass
 
 _started = False
 _start_lock = threading.Lock()
@@ -884,13 +742,13 @@ def start_background():
             t = threading.Thread(target=background_loop, daemon=True)
             t.start()
 
-# Works with both gunicorn and direct run
 with app.app_context():
     start_background()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
