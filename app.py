@@ -76,7 +76,9 @@ def fetch_all():
     # Forecasts per model
     for model in active_models():
         try:
-            data = wethr_get(f"forecasts.php?location_name={STATION}&model={requests.utils.quote(model)}&run=latest")
+            # NWS uses versioned forecasts with run=current; all others use run=latest
+            run_param = "current" if model == "NWS" else "latest"
+            data = wethr_get(f"forecasts.php?location_name={STATION}&model={requests.utils.quote(model)}&run={run_param}")
             # API returns either a list directly or a dict with a forecasts key
             if isinstance(data, list):
                 temps = data
@@ -94,13 +96,20 @@ def fetch_all():
                             except: pass
                     return None
 
-                # Filter to today's entries only (local OKC date, UTC-5/6)
-                from datetime import timezone, timedelta
-                okc_now = datetime.utcnow() - timedelta(hours=5)
-                today_str = okc_now.strftime("%Y-%m-%d")
-                today_temps = [x for x in temps if str(x.get("valid_time","")).startswith(today_str)]
+                # OKC is CDT (UTC-5). Local day runs from 05:00 UTC to 04:59 UTC next day.
+                from datetime import timedelta
+                utc_now = datetime.utcnow()
+                # Start of today in OKC = today at 05:00 UTC (midnight CDT)
+                okc_local = utc_now - timedelta(hours=5)
+                day_start_utc = okc_local.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(hours=5)
+                day_end_utc = day_start_utc + timedelta(hours=24)
+                def parse_vt(x):
+                    vt = str(x.get("valid_time",""))
+                    try: return datetime.strptime(vt[:16], "%Y-%m-%d %H:%M")
+                    except: return None
+                today_temps = [x for x in temps if parse_vt(x) is not None and day_start_utc <= parse_vt(x) < day_end_utc]
                 if not today_temps:
-                    today_temps = temps  # fallback if filtering fails
+                    today_temps = temps  # fallback
 
                 # Max temp among today's entries = forecast high
                 max_entry = max(today_temps, key=lambda x: get_temp(x) or 0)
@@ -133,10 +142,11 @@ def fetch_all():
                     "forecast_time": (meta.get("valid_time") or max_entry.get("valid_time") or
                                       max_entry.get("forecast_time") or max_entry.get("time") or "—"),
                 }
-                add_log(f"{model}: high={raw_temp}° now={current_temp}° run {run_fmt}", "ok")
+                add_log(f"{model}: high={raw_temp}° now={current_temp}° run {run_fmt} (today_entries={len(today_temps)})", "ok")
         except Exception as e:
-            errors.append(f"{model}: {e}")
-            add_log(f"{model} error: {e}", "warn")
+            err_str = str(e)
+            errors.append(f"{model}: {err_str}")
+            add_log(f"{model} error: {err_str[:80]}", "warn")
 
     add_log(f"Done. {len(state['forecasts'])} models loaded.", "ok")
     state["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -796,6 +806,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
