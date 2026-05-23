@@ -27,8 +27,10 @@ def save_json_file(path, data):
         with open(tmp, "w") as f:
             json.dump(data, f)
         os.replace(tmp, path)
+        return True
     except Exception as e:
         add_log(f"Save error {path}: {e}", "err")
+        return False
 STATION = "KOKC"
 
 ALL_KNOWN_MODELS = [
@@ -212,6 +214,7 @@ def save_pacing_snapshot(rows):
         if vals:
             avg[m] = round(sum(vals)/len(vals), 2)
     state["today_avg_pace"] = avg
+    add_log(f"Snapshot saved: {len([r for r in rows if r.get('pace') is not None])} models pacing, avg={list(avg.items())[:2]}", "info")
 
 def rollup_daily_history():
     now = okc_local_now()
@@ -322,6 +325,7 @@ def api_state():
         "log": state["log"][:30], "models": active_models(),
         "nws_versions": state["nws_versions"],
         "today_avg_pace": state["today_avg_pace"],
+        "today_snapshot_count": len(load_json_file(PACING_FILE, {}).get(okc_local_now().strftime("%Y-%m-%d"), [])),
         "prev_days": _get_prev_days(3),
     })
 
@@ -844,7 +848,7 @@ function render(data){
   var avgPace = data.today_avg_pace || {};
   var avgModels = Object.keys(avgPace);
   var avgCard = document.getElementById("avg-pace-card");
-  var todaySnaps = data.today_snapshots ? data.today_snapshots.length : 0;
+  var todaySnaps = data.today_snapshot_count || 0;
   if(avgModels.length){
     avgCard.style.display="block";
     document.getElementById("avg-pace-tbody").innerHTML = avgModels.map(function(m,i){
@@ -961,6 +965,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
