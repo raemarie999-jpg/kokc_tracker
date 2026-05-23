@@ -312,43 +312,73 @@ HTML = r"""<!DOCTYPE html>
 
 <!-- MORNING ENTRY -->
 <div class="tab" id="tab-entry">
-  <div class="card" style="border-color:#1e3a20">
-    <div class="card-title">☀️ Morning Accuracy Entry</div>
-    <p style="color:var(--dim);font-size:12px;line-height:1.7">
-      Go to <strong style="color:var(--blue)">wethr.net/accuracy</strong> → KOKC → High → 7D → Correction → Top 10.<br>
-      Fill in the Per-Model Accuracy table first, then run-specific corrections below. Saves on submit.
+
+  <!-- FAST PATH: JSON paste -->
+  <div class="card" style="border-color:#1e3a5f">
+    <div class="card-title">⚡ Fast Import — Paste JSON from Claude</div>
+    <p style="color:var(--dim);font-size:12px;line-height:1.7;margin-bottom:12px">
+      Each morning: screenshot the accuracy tables → send to Claude → paste the JSON it gives you here → done in seconds.
     </p>
+    <textarea id="json-paste" placeholder='Paste JSON here, e.g. {"ARPEGE":{"mae":0.7,"correction":0.3,"rmse":0.8,"runs":{"00Z":{"mae":0.9,"correction":0.2}}},...}'
+      style="width:100%;height:110px;background:#060a0e;border:1px solid #1e3a5f;border-radius:4px;color:#c9d4e0;padding:10px;font-family:inherit;font-size:11px;resize:vertical;outline:none"></textarea>
+    <div style="display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap">
+      <button class="btn" style="border-color:#38bdf8;color:#38bdf8" onclick="loadFromJSON()">⚡ Load JSON</button>
+      <span style="font-size:10px;color:var(--dim)" id="json-status"></span>
+    </div>
   </div>
 
-  <div class="card">
-    <div class="card-title">Overall 7D Accuracy</div>
+  <!-- MANUAL FALLBACK -->
+  <details style="margin-bottom:16px">
+    <summary style="cursor:pointer;color:var(--dim);font-size:11px;letter-spacing:1px;padding:10px 0;list-style:none">
+      ▸ Manual entry (fallback if no Claude available)
+    </summary>
+    <div style="margin-top:12px">
+      <div class="card">
+        <div class="card-title">Overall 7D Accuracy</div>
+        <div style="overflow-x:auto">
+          <table>
+            <thead><tr><th>Model</th><th>MAE (°F)</th><th>Correction (°F)</th><th>RMSE (°F)</th></tr></thead>
+            <tbody id="acc-overall-table"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">Run-Specific Corrections</div>
+        <p style="color:var(--dim);font-size:11px;margin-bottom:12px">Leave blank if a model doesn't run that cycle.</p>
+        <div style="overflow-x:auto">
+          <table id="run-entry-table">
+            <thead>
+              <tr><th>Model</th><th>00Z</th><th>03Z</th><th>06Z</th><th>09Z</th><th>12Z</th><th>15Z</th><th>18Z</th><th>21Z</th></tr>
+              <tr><th style="font-size:9px;color:var(--dimmer)">MAE / Corr</th>
+                <th colspan="8" style="font-size:9px;color:var(--dimmer);text-align:left;padding-left:10px">MAE on top · Correction below</th></tr>
+            </thead>
+            <tbody id="run-entry-body"></tbody>
+          </table>
+        </div>
+        <div style="margin-top:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <button class="btn btn-green" onclick="saveAccuracy()">💾 Save</button>
+          <button class="btn btn-red" onclick="clearAccuracy()">Clear All</button>
+          <span style="font-size:10px;color:var(--dim)" id="save-status"></span>
+        </div>
+      </div>
+    </div>
+  </details>
+
+  <!-- Current loaded data preview -->
+  <div class="card" id="acc-preview" style="display:none">
+    <div class="card-title">Currently Loaded Accuracy Data</div>
     <div style="overflow-x:auto">
       <table>
-        <thead><tr><th>Model</th><th>MAE (°F)</th><th>Correction (°F)</th><th>RMSE (°F)</th></tr></thead>
-        <tbody id="acc-overall-table"></tbody>
+        <thead><tr><th>Model</th><th>MAE</th><th>Correction</th><th>RMSE</th><th>Runs with data</th></tr></thead>
+        <tbody id="acc-preview-body"></tbody>
       </table>
+    </div>
+    <div style="margin-top:10px;display:flex;gap:10px;align-items:center">
+      <button class="btn btn-red" onclick="clearAccuracy()">Clear All</button>
+      <span style="font-size:10px;color:var(--dim)" id="acc-loaded-time"></span>
     </div>
   </div>
 
-  <div class="card">
-    <div class="card-title">Run-Specific Corrections (Accuracy by Model Run Time table)</div>
-    <p style="color:var(--dim);font-size:11px;margin-bottom:12px">Leave blank if a model doesn't run that cycle.</p>
-    <div style="overflow-x:auto">
-      <table id="run-entry-table">
-        <thead>
-          <tr><th>Model</th><th>00Z</th><th>03Z</th><th>06Z</th><th>09Z</th><th>12Z</th><th>15Z</th><th>18Z</th><th>21Z</th></tr>
-          <tr><th style="font-size:9px;color:var(--dimmer)">MAE / Corr</th>
-            <th colspan="8" style="font-size:9px;color:var(--dimmer);text-align:left;padding-left:10px">MAE on top · Correction below (each cell)</th></tr>
-        </thead>
-        <tbody id="run-entry-body"></tbody>
-      </table>
-    </div>
-    <div style="margin-top:14px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-      <button class="btn btn-green" onclick="saveAccuracy()">💾 Save Accuracy Data</button>
-      <button class="btn btn-red" onclick="clearAccuracy()">Clear All</button>
-      <span style="font-size:10px;color:var(--dim)" id="save-status"></span>
-    </div>
-  </div>
 </div>
 
 <!-- RUN ACCURACY -->
@@ -436,6 +466,54 @@ function buildEntryForms(){
     </tr>`).join("");
 }
 
+function loadFromJSON(){
+  const raw = document.getElementById("json-paste").value.trim();
+  const status = document.getElementById("json-status");
+  if(!raw){ status.style.color="var(--red)"; status.textContent="Nothing to paste."; return; }
+  try {
+    const parsed = JSON.parse(raw);
+    // Validate it has at least one known model
+    const known = MODELS.filter(m => parsed[m]);
+    if(known.length === 0){ status.style.color="var(--red)"; status.textContent="No recognisable models found in JSON."; return; }
+    accData = parsed;
+    localStorage.setItem("kokc_acc", JSON.stringify(parsed));
+    localStorage.setItem("kokc_acc_time", new Date().toLocaleString());
+    fetch("/api/accuracy",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(parsed)})
+      .then(()=>{
+        status.style.color="var(--green)";
+        status.textContent = `✓ Loaded ${known.length} models at ${new Date().toLocaleTimeString()}`;
+        document.getElementById("json-paste").value = "";
+        buildEntryForms();
+        renderAccPreview();
+        poll();
+      })
+      .catch(()=>{ status.style.color="var(--red)"; status.textContent="Server save failed."; });
+  } catch(e) {
+    status.style.color="var(--red)";
+    status.textContent = "Invalid JSON: " + e.message;
+  }
+}
+
+function renderAccPreview(){
+  const hasAny = MODELS.some(m => accData[m]?.mae);
+  const preview = document.getElementById("acc-preview");
+  if(!hasAny){ preview.style.display="none"; return; }
+  preview.style.display="block";
+  const t = localStorage.getItem("kokc_acc_time");
+  if(t) document.getElementById("acc-loaded-time").textContent = "Loaded: "+t;
+  document.getElementById("acc-preview-body").innerHTML = MODELS.map((m,i)=>{
+    const a = accData[m]||{};
+    const runsWithData = Object.entries(a.runs||{}).filter(([,v])=>v.mae||v.correction).map(([k])=>k).join(", ")||"—";
+    return `<tr style="${i%2?"background:#0a1018":""}">
+      <td style="color:#e8f0f8;font-weight:600">${m}</td>
+      <td style="color:${maeColor(a.mae)}">${a.mae?fmt1(a.mae)+"°":"—"}</td>
+      <td style="color:${corrColor(a.correction)}">${a.correction!=null&&a.correction!==""?fmtCorr(a.correction):"—"}</td>
+      <td style="color:#4a6080">${a.rmse?fmt1(a.rmse)+"°":"—"}</td>
+      <td style="color:#4a6080;font-size:11px">${runsWithData}</td>
+    </tr>`;
+  }).join("");
+}
+
 function saveAccuracy(){
   const data = {};
   MODELS.forEach(m=>{
@@ -463,8 +541,10 @@ function clearAccuracy(){
   if(!confirm("Clear all accuracy data?")) return;
   accData = {};
   localStorage.removeItem("kokc_acc");
+  localStorage.removeItem("kokc_acc_time");
   fetch("/api/accuracy",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})});
   buildEntryForms();
+  renderAccPreview();
   document.getElementById("save-status").textContent = "Cleared";
 }
 
@@ -606,6 +686,7 @@ function startCountdown(){
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 buildEntryForms();
+renderAccPreview();
 poll();
 startCountdown();
 setInterval(poll, 300000);
