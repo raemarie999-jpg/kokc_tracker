@@ -94,8 +94,16 @@ def fetch_all():
                             except: pass
                     return None
 
-                # Max temp entry = forecast high
-                max_entry = max(temps, key=lambda x: get_temp(x) or 0)
+                # Filter to today's entries only (local OKC date, UTC-5/6)
+                from datetime import timezone, timedelta
+                okc_now = datetime.utcnow() - timedelta(hours=5)
+                today_str = okc_now.strftime("%Y-%m-%d")
+                today_temps = [x for x in temps if str(x.get("valid_time","")).startswith(today_str)]
+                if not today_temps:
+                    today_temps = temps  # fallback if filtering fails
+
+                # Max temp among today's entries = forecast high
+                max_entry = max(today_temps, key=lambda x: get_temp(x) or 0)
                 raw_temp = get_temp(max_entry)
 
                 # Current-hour entry = temp model predicted for right now (for pacing)
@@ -788,6 +796,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
