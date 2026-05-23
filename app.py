@@ -181,7 +181,11 @@ def api_state():
         a = acc.get(model, {})
         fcst = state["forecasts"].get(model, {})
         raw = fcst.get("high")
-        corr = a.get("correction")
+        # Use run-specific correction if available, fall back to overall correction
+        current_run = fcst.get("run","")  # e.g. "11Z"
+        run_corr = (a.get("runs") or {}).get(current_run, {}).get("correction")
+        overall_corr = a.get("correction")
+        corr = run_corr if (run_corr not in (None,"")) else overall_corr
         try: adj = round(float(raw) + float(corr), 1) if raw is not None and corr not in (None,"") else None
         except: adj = None
         obs_temp = (state["obs"] or {}).get("temperature_display")
@@ -192,6 +196,7 @@ def api_state():
             "rank": i+1, "model": model,
             "run": fcst.get("run","—"),
             "raw_high": raw, "correction": corr,
+            "corr_source": "run" if (run_corr not in (None,"")) else "overall",
             "adj_high": adj, "pace": pace,
             "mae": a.get("mae"), "rmse": a.get("rmse"),
             "runs": a.get("runs", {}),
@@ -608,7 +613,7 @@ function render(data){
       +'<td style="color:#e8f0f8;font-weight:600">'+r.model+'</td>'
       +'<td style="color:var(--dim);font-size:11px">'+(r.run||"--")+'</td>'
       +'<td style="color:var(--yellow)">'+(r.raw_high!=null?r.raw_high+"F":"--")+'</td>'
-      +'<td style="color:'+corrColor(r.correction)+'">'+(r.correction!=null&&r.correction!==""?fmtC(r.correction):"--")+'</td>'
+      +'<td style="color:'+corrColor(r.correction)+'">'+(r.correction!=null&&r.correction!==""?fmtC(r.correction)+(r.corr_source==="run"?' <span style="font-size:9px;color:#38bdf8" title="Run-specific correction">R</span>':''):"--")+'</td>'
       +'<td style="color:var(--green);font-weight:600">'+(r.adj_high!=null?r.adj_high+"F":"--")+'</td>'
       +'<td style="color:'+(r.pace!=null?paceColor(r.pace):"#1e2e42")+'">'+(r.pace!=null?(r.pace>=0?"+":"")+r.pace+"F":"--")+'</td>'
       +'<td style="color:'+maeColor(r.mae)+'">'+(r.mae?fmt1(r.mae)+"F":"--")+'</td>'
@@ -748,6 +753,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
