@@ -77,13 +77,24 @@ def fetch_all():
     for model in active_models():
         try:
             data = wethr_get(f"forecasts.php?location_name={STATION}&model={requests.utils.quote(model)}&run=latest")
-            temps = data if isinstance(data, list) else data.get("forecasts", [])
+            # API returns either a list directly or a dict with a forecasts key
+            if isinstance(data, list):
+                temps = data
+                meta = {}
+            else:
+                temps = data.get("forecasts", [])
+                meta = data
+
             if temps:
-                max_entry = max(temps, key=lambda x: x.get("temperature_display") or x.get("temperature") or 0)
+                def temp_val(x):
+                    v = x.get("temperature_display") or x.get("temperature") or 0
+                    try: return float(v)
+                    except: return 0
+                max_entry = max(temps, key=temp_val)
                 state["forecasts"][model] = {
                     "high": max_entry.get("temperature_display") or max_entry.get("temperature"),
-                    "run": data.get("run_time") or max_entry.get("run_time", "—"),
-                    "forecast_time": max_entry.get("valid_time") or max_entry.get("forecast_time", "—"),
+                    "run": meta.get("run_time") or max_entry.get("run_time") or max_entry.get("run") or "—",
+                    "forecast_time": meta.get("valid_time") or max_entry.get("valid_time") or max_entry.get("forecast_time") or "—",
                 }
         except Exception as e:
             errors.append(f"{model}: {e}")
@@ -739,6 +750,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
