@@ -190,31 +190,50 @@ def fetch_all():
 def okc_local_now():
     return datetime.utcnow() - timedelta(hours=5)
 
+# In-memory snapshot store — survives across requests, disk is backup only
+_memory_snapshots = {}
+
 def save_pacing_snapshot(rows):
     now = okc_local_now()
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H:%M")
-    snapshots = load_json_file(PACING_FILE, {})
-    if date_str not in snapshots:
-        snapshots[date_str] = []
+
+    # Build entry
     entry = {"time": time_str}
     for r in rows:
         if r.get("pace") is not None:
             entry[r["model"]] = r["pace"]
-    snapshots[date_str].append(entry)
-    keys = sorted(snapshots.keys())
-    if len(keys) > 60:
-        for k in keys[:-60]:
-            del snapshots[k]
-    save_json_file(PACING_FILE, snapshots)
+
+    # Store in memory
+    if date_str not in _memory_snapshots:
+        _memory_snapshots[date_str] = []
+    _memory_snapshots[date_str].append(entry)
+
+    # Compute rolling average from memory
     avg = {}
     for r in rows:
         m = r["model"]
-        vals = [s[m] for s in snapshots[date_str] if m in s]
+        vals = [s[m] for s in _memory_snapshots[date_str] if m in s]
         if vals:
             avg[m] = round(sum(vals)/len(vals), 2)
     state["today_avg_pace"] = avg
-    add_log(f"Snapshot saved: {len([r for r in rows if r.get('pace') is not None])} models pacing, avg={list(avg.items())[:2]}", "info")
+
+    # Best-effort disk save for persistence across deploys
+    try:
+        ensure_data_dir()
+        disk = load_json_file(PACING_FILE, {})
+        if date_str not in disk:
+            disk[date_str] = []
+        disk[date_str].append(entry)
+        keys = sorted(disk.keys())
+        if len(keys) > 60:
+            for k in keys[:-60]:
+                del disk[k]
+        save_json_file(PACING_FILE, disk)
+    except Exception as e:
+        add_log(f"Disk snapshot error (non-fatal): {e}", "warn")
+
+    add_log(f"Snapshot: {len([r for r in rows if r.get('pace') is not None])} models | avg pace sample: {list(avg.items())[:3]}", "info")
 
 def rollup_daily_history():
     now = okc_local_now()
@@ -263,12 +282,9 @@ def background_loop():
             if t.is_alive():
                 add_log("Fetch timed out after 90s", "err")
             try:
-                snap_rows = build_snapshot_rows()
-                add_log(f"Snapshot rows: {[(r['model'],r['pace']) for r in snap_rows]}", "info")
-                save_pacing_snapshot(snap_rows)
+                save_pacing_snapshot(build_snapshot_rows())
             except Exception as e:
-                import traceback
-                add_log(f"Snapshot error: {e} | {traceback.format_exc()[-200:]}", "warn")
+                add_log(f"Snapshot error: {e}", "warn")
             now = okc_local_now()
             today_str = now.strftime("%Y-%m-%d")
             if now.hour == 1 and last_rollup_date != today_str:
@@ -968,6 +984,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
