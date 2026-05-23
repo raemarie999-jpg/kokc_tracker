@@ -6,6 +6,29 @@ import requests
 app = Flask(__name__)
 
 API_KEY = os.environ.get("WETHR_API_KEY", "")
+DATA_DIR = "/data"
+PACING_FILE = f"{DATA_DIR}/pacing_snapshots.json"
+HISTORY_FILE = f"{DATA_DIR}/daily_history.json"
+
+def ensure_data_dir():
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+def load_json_file(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except:
+        return default
+
+def save_json_file(path, data):
+    try:
+        ensure_data_dir()
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except Exception as e:
+        add_log(f"Save error {path}: {e}", "err")
 STATION = "KOKC"
 
 ALL_KNOWN_MODELS = [
@@ -24,7 +47,9 @@ state = {
     "accuracy": {},
     "last_updated": None,
     "errors": [],
-    "log": []
+    "log": [],
+    "today_snapshots": [],   # list of {time, model, pace} every 5 min
+    "today_avg_pace": {},    # {model: avg_pace} rolling same-day average
 }
 
 def active_models():
@@ -160,7 +185,73 @@ def fetch_all():
     state["errors"] = errors
     add_log(f"Done. {len(state['forecasts'])} models loaded.", "ok")
 
+def okc_local_now():
+    return datetime.utcnow() - timedelta(hours=5)
+
+def save_pacing_snapshot(rows):
+    now = okc_local_now()
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H:%M")
+    snapshots = load_json_file(PACING_FILE, {})
+    if date_str not in snapshots:
+        snapshots[date_str] = []
+    entry = {"time": time_str}
+    for r in rows:
+        if r.get("pace") is not None:
+            entry[r["model"]] = r["pace"]
+    snapshots[date_str].append(entry)
+    keys = sorted(snapshots.keys())
+    if len(keys) > 60:
+        for k in keys[:-60]:
+            del snapshots[k]
+    save_json_file(PACING_FILE, snapshots)
+    avg = {}
+    for r in rows:
+        m = r["model"]
+        vals = [s[m] for s in snapshots[date_str] if m in s]
+        if vals:
+            avg[m] = round(sum(vals)/len(vals), 2)
+    state["today_avg_pace"] = avg
+
+def rollup_daily_history():
+    now = okc_local_now()
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    snapshots = load_json_file(PACING_FILE, {})
+    if yesterday not in snapshots or not snapshots[yesterday]:
+        return
+    history = load_json_file(HISTORY_FILE, {})
+    if yesterday in history:
+        return
+    day_snaps = snapshots[yesterday]
+    models = set()
+    for s in day_snaps:
+        models.update(k for k in s.keys() if k != "time")
+    daily_avg = {}
+    for m in models:
+        vals = [s[m] for s in day_snaps if m in s]
+        if vals:
+            daily_avg[m] = round(sum(vals)/len(vals), 2)
+    history[yesterday] = {"avg_pace": daily_avg, "snapshot_count": len(day_snaps), "date": yesterday}
+    save_json_file(HISTORY_FILE, history)
+    add_log(f"Rolled up history for {yesterday} ({len(day_snaps)} snapshots)", "ok")
+
+def build_snapshot_rows():
+    acc = state["accuracy"]
+    models = [m for m in acc.keys() if m != "NWS"] if acc else ALL_KNOWN_MODELS
+    obs_temp = (state["obs"] or {}).get("temperature_display")
+    rows = []
+    for model in models:
+        fcst = state["forecasts"].get(model, {})
+        current_fcst = fcst.get("current_fcst")
+        try:
+            pace = round(float(obs_temp) - float(current_fcst), 2) if obs_temp and current_fcst else None
+        except:
+            pace = None
+        rows.append({"model": model, "pace": pace})
+    return rows
+
 def background_loop():
+    last_rollup_date = None
     while True:
         try:
             t = threading.Thread(target=fetch_all, daemon=True)
@@ -168,11 +259,25 @@ def background_loop():
             t.join(timeout=90)
             if t.is_alive():
                 add_log("Fetch timed out after 90s", "err")
+            try:
+                save_pacing_snapshot(build_snapshot_rows())
+            except Exception as e:
+                add_log(f"Snapshot error: {e}", "warn")
+            now = okc_local_now()
+            today_str = now.strftime("%Y-%m-%d")
+            if now.hour == 1 and last_rollup_date != today_str:
+                rollup_daily_history()
+                last_rollup_date = today_str
         except Exception as e:
             add_log(f"Loop error: {e}", "err")
         time.sleep(REFRESH_SEC)
 
 # ── Routes ────────────────────────────────────────────────────────────────────
+def _get_prev_days(n):
+    history = load_json_file(HISTORY_FILE, {})
+    keys = sorted(history.keys(), reverse=True)[:n]
+    return [{"date": k, "avg_pace": history[k]["avg_pace"], "snapshot_count": history[k].get("snapshot_count",0)} for k in keys]
+
 @app.route("/api/state")
 def api_state():
     acc = state["accuracy"]
@@ -216,7 +321,14 @@ def api_state():
         "last_updated": state["last_updated"], "errors": state["errors"],
         "log": state["log"][:30], "models": active_models(),
         "nws_versions": state["nws_versions"],
+        "today_avg_pace": state["today_avg_pace"],
+        "prev_days": _get_prev_days(3),
     })
+
+@app.route("/api/history")
+def api_history():
+    history = load_json_file(HISTORY_FILE, {})
+    return jsonify(history)
 
 @app.route("/api/accuracy", methods=["POST"])
 def save_accuracy():
@@ -336,6 +448,7 @@ input[type=number]:focus{border-color:var(--blue)}
   <button onclick="showTab('entry',this)">&#9728;&#65039; Morning Entry</button>
   <button onclick="showTab('runs',this)">&#128336; Run Accuracy</button>
   <button onclick="showTab('log',this)">&#128319; Log</button>
+  <button onclick="showTab('history',this)">&#128196; History</button>
 </nav>
 
 <main>
@@ -367,6 +480,21 @@ input[type=number]:focus{border-color:var(--blue)}
     <div class="ctitle">Model Pacing vs Current Obs (<span id="pace-obs">--</span>F)</div>
     <div class="pbars" id="pbars"></div>
     <div style="font-size:10px;color:var(--dimmer);margin-top:10px">Pace = current obs minus model forecast for this hour</div>
+  </div>
+
+  <div class="card" id="avg-pace-card" style="display:none">
+    <div class="ctitle">Today's Rolling Average Pace (since 1AM)</div>
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>Model</th><th>Avg Pace</th><th>Snapshots</th></tr></thead>
+        <tbody id="avg-pace-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card" id="prev-days-card" style="display:none">
+    <div class="ctitle">Previous 3 Days Average Pace</div>
+    <div style="overflow-x:auto"><table><thead id="prev-days-thead"></thead><tbody id="prev-days-tbody"></tbody></table></div>
   </div>
 
   <div class="card" id="nws-card" style="display:none">
@@ -440,6 +568,16 @@ input[type=number]:focus{border-color:var(--blue)}
   <div class="card">
     <div class="ctitle">Fetch Log</div>
     <div class="logbox" id="logbox"><div style="color:var(--dimmer)">No entries yet.</div></div>
+  </div>
+</div>
+
+<!-- HISTORY -->
+<div class="tab" id="tab-history">
+  <div class="card">
+    <div class="ctitle">Daily Pacing History</div>
+    <p style="color:var(--dim);font-size:11px;margin-bottom:12px">Average pace per model for each completed day. Positive = ran warmer than model forecast.</p>
+    <div style="overflow-x:auto"><table><thead id="hist-thead"></thead><tbody id="hist-tbody"></tbody></table></div>
+    <div style="font-size:10px;color:var(--dimmer);margin-top:10px" id="hist-count"></div>
   </div>
 </div>
 
@@ -702,6 +840,42 @@ function render(data){
     }).join("");
   }
 
+  // Today avg pace
+  var avgPace = data.today_avg_pace || {};
+  var avgModels = Object.keys(avgPace);
+  var avgCard = document.getElementById("avg-pace-card");
+  var todaySnaps = data.today_snapshots ? data.today_snapshots.length : 0;
+  if(avgModels.length){
+    avgCard.style.display="block";
+    document.getElementById("avg-pace-tbody").innerHTML = avgModels.map(function(m,i){
+      var p = avgPace[m];
+      var bg = i%2?"background:#0a1018":"";
+      var pc = paceColor(p);
+      return '<tr style="'+bg+'"><td style="color:#e8f0f8;font-weight:600">'+m+'</td>'
+        +'<td style="color:'+pc+';font-weight:600">'+(p>=0?"+":"")+p.toFixed(2)+'F</td>'
+        +'<td style="color:var(--dim)">'+todaySnaps+'</td></tr>';
+    }).join("");
+  } else { avgCard.style.display="none"; }
+
+  // Prev 3 days
+  var prevDays = data.prev_days || [];
+  var prevCard = document.getElementById("prev-days-card");
+  if(prevDays.length){
+    prevCard.style.display="block";
+    var allModels = [];
+    prevDays.forEach(function(d){ Object.keys(d.avg_pace).forEach(function(m){ if(!allModels.includes(m)) allModels.push(m); }); });
+    document.getElementById("prev-days-thead").innerHTML = '<tr><th>Model</th>'+prevDays.map(function(d){ return '<th>'+d.date.slice(5)+'</th>'; }).join("")+'</tr>';
+    document.getElementById("prev-days-tbody").innerHTML = allModels.map(function(m,i){
+      var bg = i%2?"background:#0a1018":"";
+      var cells = prevDays.map(function(d){
+        var p = d.avg_pace[m];
+        if(p==null) return '<td style="color:#1e2e42">--</td>';
+        return '<td style="color:'+paceColor(p)+';font-weight:600">'+(p>=0?"+":"")+p.toFixed(2)+'F</td>';
+      }).join("");
+      return '<tr style="'+bg+'"><td style="color:#e8f0f8;font-weight:600">'+m+'</td>'+cells+'</tr>';
+    }).join("");
+  } else { prevCard.style.display="none"; }
+
   // Status
   document.getElementById("sdot").className = "dot "+(data.errors&&data.errors.length?"dot-yellow":"dot-green");
   document.getElementById("stxt").textContent = data.last_updated?"Updated "+data.last_updated.slice(11,16):"Live";
@@ -732,6 +906,39 @@ function startCountdown(){
 }
 
 buildForms(); renderPreview(); poll(); startCountdown(); setInterval(poll,300000);
+
+function loadHistory(){
+  fetch("/api/history").then(function(r){ return r.json(); }).then(function(history){
+    var dates = Object.keys(history).sort().reverse();
+    var thead = document.getElementById("hist-thead");
+    var tbody = document.getElementById("hist-tbody");
+    var countEl = document.getElementById("hist-count");
+    if(!dates.length){
+      tbody.innerHTML = '<tr><td colspan="2" style="color:var(--dim)">No history yet. Data accumulates after the first full day.</td></tr>';
+      return;
+    }
+    var allModels = [];
+    dates.forEach(function(d){ Object.keys(history[d].avg_pace).forEach(function(m){ if(!allModels.includes(m)) allModels.push(m); }); });
+    thead.innerHTML = '<tr><th>Model</th>'+dates.map(function(d){ return '<th>'+d+'</th>'; }).join("")+'</tr>';
+    tbody.innerHTML = allModels.map(function(m,i){
+      var bg = i%2?"background:#0a1018":"";
+      var cells = dates.map(function(d){
+        var p = history[d].avg_pace[m];
+        if(p==null) return '<td style="color:#1e2e42">--</td>';
+        return '<td style="color:'+paceColor(p)+';font-weight:600">'+(p>=0?"+":"")+p.toFixed(2)+'F</td>';
+      }).join("");
+      return '<tr style="'+bg+'"><td style="color:#e8f0f8;font-weight:600">'+m+'</td>'+cells+'</tr>';
+    }).join("");
+    countEl.textContent = dates.length+" days stored";
+  }).catch(function(e){ console.error("History load error",e); });
+}
+
+// Load history when tab is clicked
+document.querySelectorAll("nav button").forEach(function(btn){
+  btn.addEventListener("click", function(){
+    if(btn.textContent.includes("History")) loadHistory();
+  });
+});
 </script>
 </body>
 </html>
@@ -754,6 +961,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
