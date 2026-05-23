@@ -90,18 +90,17 @@ def fetch_all():
                 if model == active_models()[0]:
                     add_log(f"API keys sample: {list(temps[0].keys())[:10]}", "info")
                 def temp_val(x):
-                    for k in ["temperature_display","temperature","temp","value","high"]:
+                    for k in ["temperature_f","temperature_display","temperature","temp","value","high"]:
                         v = x.get(k)
                         if v is not None:
                             try: return float(v)
                             except: pass
                     return 0
                 max_entry = max(temps, key=temp_val)
-                # Get temp value from whatever field is available
                 raw_temp = None
-                for k in ["temperature_display","temperature","temp","value","high"]:
+                for k in ["temperature_f","temperature_display","temperature","temp","value","high"]:
                     if max_entry.get(k) is not None:
-                        raw_temp = max_entry.get(k)
+                        raw_temp = round(float(max_entry.get(k)), 1)
                         break
                 # Get run time and format as e.g. "12Z"
                 run_raw = (meta.get("run_time") or meta.get("run") or
