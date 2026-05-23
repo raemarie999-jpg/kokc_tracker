@@ -263,9 +263,12 @@ def background_loop():
             if t.is_alive():
                 add_log("Fetch timed out after 90s", "err")
             try:
-                save_pacing_snapshot(build_snapshot_rows())
+                snap_rows = build_snapshot_rows()
+                add_log(f"Snapshot rows: {[(r['model'],r['pace']) for r in snap_rows]}", "info")
+                save_pacing_snapshot(snap_rows)
             except Exception as e:
-                add_log(f"Snapshot error: {e}", "warn")
+                import traceback
+                add_log(f"Snapshot error: {e} | {traceback.format_exc()[-200:]}", "warn")
             now = okc_local_now()
             today_str = now.strftime("%Y-%m-%d")
             if now.hour == 1 and last_rollup_date != today_str:
@@ -965,6 +968,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
