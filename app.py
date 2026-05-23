@@ -28,9 +28,9 @@ state = {
 }
 
 def active_models():
+    # Use accuracy keys if available (preserves user's ranked order), else fetch all known
     acc = state.get("accuracy", {})
-    # Exclude NWS from regular model list - handled separately
-    models = [m for m in acc.keys() if m != "NWS"] if acc else ALL_KNOWN_MODELS[:9]
+    models = [m for m in acc.keys() if m != "NWS"] if acc else ALL_KNOWN_MODELS
     return models
 
 def add_log(msg, level="info"):
@@ -102,9 +102,10 @@ def fetch_all():
         errors.append(f"WethrHigh: {e}")
         add_log(f"Wethr High error: {e}", "err")
 
-    # Forecasts per model
+    # Forecasts per model — always fetch all known models so data is ready before accuracy is entered
+    fetch_targets = active_models() if state.get("accuracy") else ALL_KNOWN_MODELS
     utc_now = datetime.utcnow()
-    for model in active_models():
+    for model in fetch_targets:
         try:
             data = wethr_get(f"forecasts.php?location_name={STATION}&model={requests.utils.quote(model)}&run=latest")
             temps = data if isinstance(data, list) else data.get("forecasts", [])
@@ -753,6 +754,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
