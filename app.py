@@ -78,6 +78,7 @@ def fetch_all():
         try:
             data = wethr_get(f"forecasts.php?location_name={STATION}&model={requests.utils.quote(model)}&run=latest")
             # API returns either a list directly or a dict with a forecasts key
+            add_log(f"{model} raw type: {type(data).__name__}, sample: {str(data)[:120]}", "info")
             if isinstance(data, list):
                 temps = data
                 meta = {}
@@ -750,7 +751,3 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
-
-
-
