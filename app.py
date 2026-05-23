@@ -86,17 +86,38 @@ def fetch_all():
                 meta = data
 
             if temps:
+                # Log first entry keys so we can see exact field names once
+                if model == active_models()[0]:
+                    add_log(f"API keys sample: {list(temps[0].keys())[:10]}", "info")
                 def temp_val(x):
-                    v = x.get("temperature_display") or x.get("temperature") or 0
-                    try: return float(v)
-                    except: return 0
+                    for k in ["temperature_display","temperature","temp","value","high"]:
+                        v = x.get(k)
+                        if v is not None:
+                            try: return float(v)
+                            except: pass
+                    return 0
                 max_entry = max(temps, key=temp_val)
+                # Get temp value from whatever field is available
+                raw_temp = None
+                for k in ["temperature_display","temperature","temp","value","high"]:
+                    if max_entry.get(k) is not None:
+                        raw_temp = max_entry.get(k)
+                        break
+                # Get run time and format as e.g. "12Z"
+                run_raw = (meta.get("run_time") or meta.get("run") or
+                           max_entry.get("run_time") or max_entry.get("run") or "")
+                try:
+                    # Convert "2026-05-23 06:00:00" -> "06Z"
+                    run_fmt = run_raw[11:13] + "Z" if len(run_raw) >= 13 else run_raw or "—"
+                except:
+                    run_fmt = run_raw or "—"
                 state["forecasts"][model] = {
-                    "high": max_entry.get("temperature_display") or max_entry.get("temperature"),
-                    "run": meta.get("run_time") or max_entry.get("run_time") or max_entry.get("run") or "—",
-                    "forecast_time": meta.get("valid_time") or max_entry.get("valid_time") or max_entry.get("forecast_time") or "—",
+                    "high": raw_temp,
+                    "run": run_fmt,
+                    "forecast_time": (meta.get("valid_time") or max_entry.get("valid_time") or
+                                      max_entry.get("forecast_time") or max_entry.get("time") or "—"),
                 }
-                add_log(f"{model}: {state['forecasts'][model]['high']}° run {state['forecasts'][model]['run']}", "ok")
+                add_log(f"{model}: {raw_temp}° run {run_fmt}", "ok")
         except Exception as e:
             errors.append(f"{model}: {e}")
             add_log(f"{model} error: {e}", "warn")
@@ -758,4 +779,5 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
