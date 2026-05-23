@@ -714,7 +714,6 @@ setInterval(poll, 300000);
 </html>
 """
 
-# Start background fetch thread regardless of how app is launched (gunicorn or direct)
 if os.path.exists("accuracy.json"):
     try:
         with open("accuracy.json") as f:
@@ -722,10 +721,17 @@ if os.path.exists("accuracy.json"):
     except Exception:
         pass
 
-_bg_thread = threading.Thread(target=background_loop, daemon=True)
-_bg_thread.start()
+def start_background():
+    t = threading.Thread(target=background_loop, daemon=True)
+    t.start()
+
+# Gunicorn calls this after forking a worker
+def post_fork(server, worker):
+    start_background()
 
 if __name__ == "__main__":
+    start_background()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
