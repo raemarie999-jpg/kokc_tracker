@@ -281,6 +281,7 @@ def background_loop():
             t.join(timeout=90)
             if t.is_alive():
                 add_log("Fetch timed out after 90s", "err")
+            add_log("About to save snapshot", "info")
             try:
                 save_pacing_snapshot(build_snapshot_rows())
             except Exception as e:
@@ -984,6 +985,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
