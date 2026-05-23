@@ -714,13 +714,18 @@ setInterval(poll, 300000);
 </html>
 """
 
-if __name__ == "__main__":
-    # Push saved accuracy on startup
-    if os.path.exists("accuracy.json"):
+# Start background fetch thread regardless of how app is launched (gunicorn or direct)
+if os.path.exists("accuracy.json"):
+    try:
         with open("accuracy.json") as f:
             state["accuracy"] = json.load(f)
+    except Exception:
+        pass
 
-    t = threading.Thread(target=background_loop, daemon=True)
-    t.start()
+_bg_thread = threading.Thread(target=background_loop, daemon=True)
+_bg_thread.start()
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
