@@ -150,7 +150,7 @@ def fetch_all():
 
     # NWS — separate endpoint
     try:
-        nws_data = wethr_get(f"nws_forecasts.php?station_code={STATION}")
+        nws_data = wethr_get(f"nws.php?station_code={STATION}")
         from datetime import timedelta
         utc_now = datetime.utcnow()
         okc_local = utc_now - timedelta(hours=5)
@@ -888,6 +888,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
