@@ -30,7 +30,8 @@ state = {
     "accuracy": {},
     "last_updated": None,
     "errors": [],
-    "log": []
+    "log": [],
+    "nws_versions": {}
 }
 
 def add_log(msg, level="info"):
@@ -76,11 +77,8 @@ def fetch_all():
     # Forecasts per model
     for model in active_models():
         try:
-            # NWS uses versioned forecasts with run=current; all others use run=latest
-            run_param = "current" if model == "NWS" else "latest"
-            data = wethr_get(f"forecasts.php?location_name={STATION}&model={requests.utils.quote(model)}&run={run_param}")
-            if model == "NWS":
-                add_log(f"NWS raw: type={type(data).__name__} len={len(data) if isinstance(data,(list,dict)) else '?'} sample={str(data)[:120]}", "info")
+            if model == "NWS": continue  # NWS handled separately
+            data = wethr_get(f"forecasts.php?location_name={STATION}&model={requests.utils.quote(model)}&run=latest")
             # API returns either a list directly or a dict with a forecasts key
             if isinstance(data, list):
                 temps = data
@@ -150,6 +148,47 @@ def fetch_all():
             errors.append(f"{model}: {err_str}")
             add_log(f"{model} error: {err_str[:80]}", "warn")
 
+    # NWS — separate endpoint
+    try:
+        nws_data = wethr_get(f"nws_forecasts.php?station_code={STATION}")
+        from datetime import timedelta
+        utc_now = datetime.utcnow()
+        okc_local = utc_now - timedelta(hours=5)
+        day_start_utc = okc_local.replace(hour=0,minute=0,second=0,microsecond=0) + timedelta(hours=5)
+        day_end_utc = day_start_utc + timedelta(hours=24)
+        versions = {}
+        entries = nws_data if isinstance(nws_data, list) else nws_data.get("forecasts", [])
+        for entry in entries:
+            ver = entry.get("version") or entry.get("forecast_version") or entry.get("run") or "current"
+            vt_str = str(entry.get("valid_time",""))
+            try:
+                vt = datetime.strptime(vt_str[:16], "%Y-%m-%d %H:%M")
+            except:
+                continue
+            if not (day_start_utc <= vt < day_end_utc):
+                continue
+            temp_f = None
+            for k in ["temperature_f","temperature_display","temperature"]:
+                if entry.get(k) is not None:
+                    try: temp_f = round(float(entry[k]),1); break
+                    except: pass
+            if ver not in versions:
+                versions[ver] = []
+            if temp_f is not None:
+                versions[ver].append({"vt": vt, "temp": temp_f})
+        # Find high and current-hour per version
+        nws_versions = {}
+        for ver, pts in versions.items():
+            if not pts: continue
+            high = max(pts, key=lambda x: x["temp"])["temp"]
+            closest = min(pts, key=lambda x: abs((x["vt"]-utc_now).total_seconds()))
+            nws_versions[ver] = {"high": high, "current_fcst": closest["temp"]}
+        state["nws_versions"] = nws_versions
+        add_log(f"NWS: {len(nws_versions)} versions loaded", "ok")
+    except Exception as e:
+        add_log(f"NWS error: {str(e)[:80]}", "warn")
+        state["nws_versions"] = {}
+
     add_log(f"Done. {len(state['forecasts'])} models loaded.", "ok")
     state["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     state["errors"] = errors
@@ -216,6 +255,7 @@ def api_state():
         "errors": state["errors"],
         "log": state["log"][:30],
         "models": active_models(),
+        "nws_versions": state["nws_versions"],
     })
 
 @app.route("/api/accuracy", methods=["POST"])
@@ -387,7 +427,17 @@ HTML = r"""<!DOCTYPE html>
     <div class="card-title">Model Pacing vs Current Obs (<span id="pace-obs-val">—</span>°F)</div>
     <div class="pace-bar-wrap" id="pace-bars"></div>
     <div style="font-size:10px;color:var(--dimmer);margin-top:10px">
-      Pace = current obs minus model forecast high. Green = running warmer than model.
+      Pace = current obs minus model's forecast for this hour.
+    </div>
+  </div>
+
+  <div class="card" id="nws-card" style="display:none">
+    <div class="card-title">🏛 NWS Forecast Versions</div>
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>Version</th><th>Fcst High</th><th>Adj High</th><th>Current Fcst</th><th>Obs Pace</th></tr></thead>
+        <tbody id="nws-table"></tbody>
+      </table>
     </div>
   </div>
 </div>
@@ -738,6 +788,36 @@ function render(data){
     ).join("");
   }
 
+  // NWS versions
+  const nws = data.nws_versions || {};
+  const nwsKeys = Object.keys(nws);
+  const nwsCard = document.getElementById("nws-card");
+  if(nwsKeys.length){
+    nwsCard.style.display = "block";
+    const nwsAcc = (accData["NWS"] || {});
+    const nwsCorr = nwsAcc.correction != null && nwsAcc.correction !== "" ? Number(nwsAcc.correction) : null;
+    const obsTemp = obs ? Number(obs.temperature_display) : null;
+    // Sort: current first, then V1,V2... descending
+    const sorted = nwsKeys.sort((a,b)=>{
+      if(a==="current") return -1; if(b==="current") return 1;
+      return parseInt(b.replace("V",""))||0 - parseInt(a.replace("V",""))||0;
+    });
+    document.getElementById("nws-table").innerHTML = sorted.map((ver,i)=>{
+      const v = nws[ver];
+      const adj = v.high != null && nwsCorr != null ? (v.high + nwsCorr).toFixed(1) : null;
+      const pace = obsTemp && v.current_fcst != null ? (obsTemp - v.current_fcst).toFixed(1) : null;
+      return `<tr style="${i%2?"background:#0a1018":""}">
+        <td style="color:${ver==="current"?"var(--green)":"var(--blue)");font-weight:600">${ver==="current"?"Current":ver}</td>
+        <td style="color:var(--yellow)">${v.high!=null?v.high+"°":"—"}</td>
+        <td style="color:var(--green)">${adj?adj+"°":"—"}</td>
+        <td style="color:#94a3b8">${v.current_fcst!=null?v.current_fcst+"°":"—"}</td>
+        <td style="color:${pace!=null?paceColor(pace):"#1e2e42"}">${pace!=null?(Number(pace)>=0?"+":"")+pace+"°":"—"}</td>
+      </tr>`;
+    }).join("");
+  } else {
+    nwsCard.style.display = "none";
+  }
+
   // Status
   const dot = document.getElementById("status-dot");
   const txt = document.getElementById("status-text");
@@ -808,6 +888,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
