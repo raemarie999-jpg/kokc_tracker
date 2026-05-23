@@ -86,22 +86,30 @@ def fetch_all():
                 meta = data
 
             if temps:
-                # Log first entry keys so we can see exact field names once
-                if model == active_models()[0]:
-                    add_log(f"API keys sample: {list(temps[0].keys())[:10]}", "info")
-                def temp_val(x):
+                def get_temp(x):
                     for k in ["temperature_f","temperature_display","temperature","temp","value","high"]:
                         v = x.get(k)
                         if v is not None:
-                            try: return float(v)
+                            try: return round(float(v), 1)
                             except: pass
-                    return 0
-                max_entry = max(temps, key=temp_val)
-                raw_temp = None
-                for k in ["temperature_f","temperature_display","temperature","temp","value","high"]:
-                    if max_entry.get(k) is not None:
-                        raw_temp = round(float(max_entry.get(k)), 1)
-                        break
+                    return None
+
+                # Max temp entry = forecast high
+                max_entry = max(temps, key=lambda x: get_temp(x) or 0)
+                raw_temp = get_temp(max_entry)
+
+                # Current-hour entry = temp model predicted for right now (for pacing)
+                now_utc = datetime.utcnow()
+                def time_diff(x):
+                    vt = x.get("valid_time","")
+                    try:
+                        from datetime import datetime as dt
+                        t = dt.strptime(vt[:16], "%Y-%m-%d %H:%M")
+                        return abs((t - now_utc).total_seconds())
+                    except:
+                        return float("inf")
+                current_entry = min(temps, key=time_diff)
+                current_temp = get_temp(current_entry)
                 # Get run time and format as e.g. "12Z"
                 run_raw = (meta.get("run_time") or meta.get("run") or
                            max_entry.get("run_time") or max_entry.get("run") or "")
@@ -112,11 +120,12 @@ def fetch_all():
                     run_fmt = run_raw or "—"
                 state["forecasts"][model] = {
                     "high": raw_temp,
+                    "current_fcst": current_temp,
                     "run": run_fmt,
                     "forecast_time": (meta.get("valid_time") or max_entry.get("valid_time") or
                                       max_entry.get("forecast_time") or max_entry.get("time") or "—"),
                 }
-                add_log(f"{model}: {raw_temp}° run {run_fmt}", "ok")
+                add_log(f"{model}: high={raw_temp}° now={current_temp}° run {run_fmt}", "ok")
         except Exception as e:
             errors.append(f"{model}: {e}")
             add_log(f"{model} error: {e}", "warn")
@@ -151,7 +160,8 @@ def api_state():
         corr = a.get("correction")
         adj = round(raw + float(corr), 1) if raw is not None and corr not in (None, "") else None
         obs_temp = (state["obs"] or {}).get("temperature_display")
-        pace = round(float(obs_temp) - float(raw), 1) if obs_temp and raw else None
+        current_fcst = fcst.get("current_fcst")
+        pace = round(float(obs_temp) - float(current_fcst), 1) if obs_temp and current_fcst else None
         rows.append({
             "rank": i+1, "model": model,
             "run": fcst.get("run", "—"),
@@ -778,5 +788,6 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
