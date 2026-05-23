@@ -79,6 +79,8 @@ def fetch_all():
             # NWS uses versioned forecasts with run=current; all others use run=latest
             run_param = "current" if model == "NWS" else "latest"
             data = wethr_get(f"forecasts.php?location_name={STATION}&model={requests.utils.quote(model)}&run={run_param}")
+            if model == "NWS":
+                add_log(f"NWS raw: type={type(data).__name__} len={len(data) if isinstance(data,(list,dict)) else '?'} sample={str(data)[:120]}", "info")
             # API returns either a list directly or a dict with a forecasts key
             if isinstance(data, list):
                 temps = data
@@ -806,6 +808,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
