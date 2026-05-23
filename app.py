@@ -721,17 +721,24 @@ if os.path.exists("accuracy.json"):
     except Exception:
         pass
 
-def start_background():
-    t = threading.Thread(target=background_loop, daemon=True)
-    t.start()
+_started = False
+_start_lock = threading.Lock()
 
-# Gunicorn calls this after forking a worker
-def post_fork(server, worker):
+def start_background():
+    global _started
+    with _start_lock:
+        if not _started:
+            _started = True
+            t = threading.Thread(target=background_loop, daemon=True)
+            t.start()
+
+# Works with both gunicorn and direct run
+with app.app_context():
     start_background()
 
 if __name__ == "__main__":
-    start_background()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
