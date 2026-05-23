@@ -43,7 +43,7 @@ def wethr_get(path):
     r = requests.get(
         f"https://wethr.net/api/v2/{path}",
         headers={"X-API-Key": API_KEY},
-        timeout=10
+        timeout=8
     )
     r.raise_for_status()
     return r.json()
@@ -78,7 +78,6 @@ def fetch_all():
         try:
             data = wethr_get(f"forecasts.php?location_name={STATION}&model={requests.utils.quote(model)}&run=latest")
             # API returns either a list directly or a dict with a forecasts key
-            add_log(f"{model} raw type: {type(data).__name__}, sample: {str(data)[:120]}", "info")
             if isinstance(data, list):
                 temps = data
                 meta = {}
@@ -97,6 +96,7 @@ def fetch_all():
                     "run": meta.get("run_time") or max_entry.get("run_time") or max_entry.get("run") or "—",
                     "forecast_time": meta.get("valid_time") or max_entry.get("valid_time") or max_entry.get("forecast_time") or "—",
                 }
+                add_log(f"{model}: {state['forecasts'][model]['high']}° run {state['forecasts'][model]['run']}", "ok")
         except Exception as e:
             errors.append(f"{model}: {e}")
             add_log(f"{model} error: {e}", "warn")
@@ -107,7 +107,14 @@ def fetch_all():
 
 def background_loop():
     while True:
-        fetch_all()
+        try:
+            t = threading.Thread(target=fetch_all, daemon=True)
+            t.start()
+            t.join(timeout=90)  # give up after 90 seconds
+            if t.is_alive():
+                add_log("Fetch timed out after 90s", "err")
+        except Exception as e:
+            add_log(f"Background loop error: {e}", "err")
         time.sleep(REFRESH_SEC)
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -751,3 +758,4 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
