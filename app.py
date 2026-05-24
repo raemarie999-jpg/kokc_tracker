@@ -481,19 +481,19 @@ input[type=number]:focus{border-color:var(--blue)}
     <div style="font-size:10px;color:var(--dimmer);margin-top:10px">Pace = current obs minus model forecast for this hour</div>
   </div>
 
-  <div class="card" id="avg-pace-card" style="display:none">
+  <div class="card" id="avg-pace-card">
     <div class="ctitle">Today's Rolling Average Pace (since 1AM)</div>
     <div style="overflow-x:auto">
       <table>
         <thead><tr><th>Model</th><th>Avg Pace</th><th>Snapshots</th></tr></thead>
-        <tbody id="avg-pace-tbody"></tbody>
+        <tbody id="avg-pace-tbody"><tr><td colspan="3" style="color:var(--dim)">Accumulating data...</td></tr></tbody>
       </table>
     </div>
   </div>
 
-  <div class="card" id="prev-days-card" style="display:none">
+  <div class="card" id="prev-days-card">
     <div class="ctitle">Previous 3 Days Average Pace</div>
-    <div style="overflow-x:auto"><table><thead id="prev-days-thead"></thead><tbody id="prev-days-tbody"></tbody></table></div>
+    <div style="overflow-x:auto"><table><thead id="prev-days-thead"></thead><tbody id="prev-days-tbody"><tr><td style="color:var(--dim)">No history yet</td></tr></tbody></table></div>
   </div>
 
   <div class="card" id="nws-card" style="display:none">
@@ -845,7 +845,6 @@ function render(data){
   var avgCard = document.getElementById("avg-pace-card");
   var todaySnaps = data.today_snapshot_count || 0;
   if(avgModels.length){
-    avgCard.style.display="block";
     document.getElementById("avg-pace-tbody").innerHTML = avgModels.map(function(m,i){
       var p = avgPace[m];
       var bg = i%2?"background:#0a1018":"";
@@ -854,13 +853,14 @@ function render(data){
         +'<td style="color:'+pc+';font-weight:600">'+(p>=0?"+":"")+p.toFixed(2)+'F</td>'
         +'<td style="color:var(--dim)">'+todaySnaps+'</td></tr>';
     }).join("");
-  } else { avgCard.style.display="none"; }
+  } else {
+    document.getElementById("avg-pace-tbody").innerHTML = '<tr><td colspan="3" style="color:var(--dim)">Accumulating — updates every 5 min</td></tr>';
+  }
 
   // Prev 3 days
   var prevDays = data.prev_days || [];
   var prevCard = document.getElementById("prev-days-card");
   if(prevDays.length){
-    prevCard.style.display="block";
     var allModels = [];
     prevDays.forEach(function(d){ Object.keys(d.avg_pace).forEach(function(m){ if(!allModels.includes(m)) allModels.push(m); }); });
     document.getElementById("prev-days-thead").innerHTML = '<tr><th>Model</th>'+prevDays.map(function(d){ return '<th>'+d.date.slice(5)+'</th>'; }).join("")+'</tr>';
@@ -873,7 +873,10 @@ function render(data){
       }).join("");
       return '<tr style="'+bg+'"><td style="color:#e8f0f8;font-weight:600">'+m+'</td>'+cells+'</tr>';
     }).join("");
-  } else { prevCard.style.display="none"; }
+  } else {
+    document.getElementById("prev-days-thead").innerHTML = '';
+    document.getElementById("prev-days-tbody").innerHTML = '<tr><td style="color:var(--dim)">No history yet — builds after first full day</td></tr>';
+  }
 
   // Status
   document.getElementById("sdot").className = "dot "+(data.errors&&data.errors.length?"dot-yellow":"dot-green");
@@ -960,6 +963,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
