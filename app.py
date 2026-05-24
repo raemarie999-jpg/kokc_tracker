@@ -31,7 +31,8 @@ def save_json_file(path, data):
     except Exception as e:
         add_log(f"Save error {path}: {e}", "err")
         return False
-STATION = "KOKC"
+STATIONS = ["KOKC", "KPHL"]
+STATION_NAMES = {"KOKC": "Oklahoma City", "KPHL": "Philadelphia"}
 
 ALL_KNOWN_MODELS = [
     "ARPEGE","HRRR","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NAM-MOS","NBM",
@@ -41,30 +42,35 @@ RUN_CYCLES = ["00Z","01Z","02Z","03Z","04Z","05Z","06Z","07Z","08Z","09Z","10Z",
               "12Z","13Z","14Z","15Z","16Z","17Z","18Z","19Z","20Z","21Z","22Z","23Z"]
 REFRESH_SEC = 300
 
-state = {
-    "obs": None,
-    "wethr_high": None,
-    "forecasts": {},
-    "nws_versions": {},
-    "accuracy": {},
-    "last_updated": None,
-    "errors": [],
-    "log": [],
-    "today_snapshots": [],   # list of {time, model, pace} every 5 min
-    "today_avg_pace": {},    # {model: avg_pace} rolling same-day average
-}
+def make_state():
+    return {
+        "obs": None,
+        "wethr_high": None,
+        "forecasts": {},
+        "nws_versions": {},
+        "accuracy": {},
+        "last_updated": None,
+        "errors": [],
+        "log": [],
+        "today_avg_pace": {},
+    }
 
-def active_models():
-    # Use accuracy keys if available (preserves user's ranked order), else fetch all known
-    acc = state.get("accuracy", {})
+states = {s: make_state() for s in STATIONS}
+
+def get_state(station=None):
+    return states.get(station or "KOKC", states["KOKC"])
+
+def active_models(station="KOKC"):
+    acc = get_state(station).get("accuracy", {})
     models = [m for m in acc.keys() if m != "NWS"] if acc else ALL_KNOWN_MODELS
     return models
 
-def add_log(msg, level="info"):
+def add_log(msg, level="info", station="KOKC"):
     entry = {"t": datetime.now().strftime("%H:%M:%S"), "msg": msg, "level": level}
-    state["log"].insert(0, entry)
-    state["log"] = state["log"][:100]
-    print(f"[{entry['t']}] {msg}")
+    st = get_state(station)
+    st["log"].insert(0, entry)
+    st["log"] = st["log"][:100]
+    print(f"[{station}][{entry['t']}] {msg}")
 
 def wethr_get(path):
     r = requests.get(
@@ -104,33 +110,34 @@ def fmt_run(run_raw):
     except:
         return "—"
 
-def fetch_all():
+def fetch_all(station="KOKC"):
+    st = get_state(station)
     if not API_KEY:
-        add_log("No API key set", "err")
+        add_log("No API key set", "err", station)
         return
-    add_log("Fetching data...")
+    add_log("Fetching data...", "info", station)
     errors = []
 
     # Observation
     try:
         obs = wethr_get(f"observations.php?station_code={STATION}&mode=latest")
-        state["obs"] = obs
-        add_log(f"Obs: {obs.get('temperature_display')}F", "ok")
+        st["obs"] = obs
+        add_log(f"Obs: {obs.get('temperature_display')}F", "ok", station)
     except Exception as e:
         errors.append(f"Obs: {e}")
-        add_log(f"Obs error: {e}", "err")
+        add_log(f"Obs error: {e}", "err", station)
 
     # Wethr high
     try:
         wh = wethr_get(f"observations.php?station_code={STATION}&mode=wethr_high&logic=nws")
-        state["wethr_high"] = wh
-        add_log(f"Wethr High: {wh.get('wethr_high')}F", "ok")
+        st["wethr_high"] = wh
+        add_log(f"Wethr High: {wh.get('wethr_high')}F", "ok", station)
     except Exception as e:
         errors.append(f"WethrHigh: {e}")
-        add_log(f"Wethr High error: {e}", "err")
+        add_log(f"Wethr High error: {e}", "err", station)
 
     # Forecasts per model — always fetch all known models so data is ready before accuracy is entered
-    fetch_targets = active_models() if state.get("accuracy") else ALL_KNOWN_MODELS
+    fetch_targets = active_models(station) if st.get("accuracy") else ALL_KNOWN_MODELS
     utc_now = datetime.utcnow()
     for model in fetch_targets:
         try:
@@ -145,12 +152,12 @@ def fetch_all():
                 current_temp = get_temp(closest)
                 run_raw = meta.get("run_time") or max_entry.get("run_time") or max_entry.get("run") or ""
                 run_fmt = fmt_run(run_raw)
-                state["forecasts"][model] = {
+                st["forecasts"][model] = {
                     "high": raw_temp,
                     "current_fcst": current_temp,
                     "run": run_fmt,
                 }
-                add_log(f"{model}: high={raw_temp} now={current_temp} run={run_fmt} ({len(todays)} entries)", "ok")
+                add_log(f"{model}: high={raw_temp} now={current_temp} run={run_fmt} ({len(todays)} entries)", "ok", station)
         except Exception as e:
             errors.append(f"{model}: {e}")
             add_log(f"{model} error: {str(e)[:80]}", "warn")
@@ -158,16 +165,16 @@ def fetch_all():
     # NWS skipped for now — endpoint TBD
     state["nws_versions"] = {}
 
-    state["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    state["errors"] = errors
-    add_log(f"Done. {len(state['forecasts'])} models loaded.", "ok")
+    st["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st["errors"] = errors
+    add_log(f"Done. {len(st['forecasts'])} models loaded.", "ok", station)
 
     # Save pacing snapshot here — guaranteed to run after fetch completes
     try:
         rows = build_snapshot_rows()
         save_pacing_snapshot(rows)
     except Exception as e:
-        add_log(f"Snapshot error: {e}", "warn")
+        add_log(f"Snapshot error: {e}", "warn", station)
 
 def okc_local_now():
     return datetime.utcnow() - timedelta(hours=5)
@@ -175,7 +182,8 @@ def okc_local_now():
 # In-memory snapshot store — survives across requests, disk is backup only
 _memory_snapshots = {}
 
-def save_pacing_snapshot(rows):
+def save_pacing_snapshot(rows, station="KOKC"):
+    st = get_state(station)
     now = okc_local_now()
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H:%M")
@@ -198,12 +206,12 @@ def save_pacing_snapshot(rows):
         vals = [s[m] for s in _memory_snapshots[date_str] if m in s]
         if vals:
             avg[m] = round(sum(vals)/len(vals), 2)
-    state["today_avg_pace"] = avg
+    st["today_avg_pace"] = avg
 
     # Best-effort disk save for persistence across deploys
     try:
         ensure_data_dir()
-        disk = load_json_file(PACING_FILE, {})
+        disk = load_json_file(f"{DATA_DIR}/pacing_{station}.json", {})
         if date_str not in disk:
             disk[date_str] = []
         disk[date_str].append(entry)
@@ -211,19 +219,21 @@ def save_pacing_snapshot(rows):
         if len(keys) > 60:
             for k in keys[:-60]:
                 del disk[k]
-        save_json_file(PACING_FILE, disk)
+        save_json_file(f"{DATA_DIR}/pacing_{station}.json", disk)
     except Exception as e:
-        add_log(f"Disk snapshot error (non-fatal): {e}", "warn")
+        add_log(f"Disk snapshot error (non-fatal): {e}", "warn", station)
 
-    add_log(f"Snapshot: {len([r for r in rows if r.get('pace') is not None])} models | avg pace sample: {list(avg.items())[:3]}", "info")
+    add_log(f"Snapshot: {len([r for r in rows if r.get('pace') is not None])} models | avg pace sample: {list(avg.items())[:3]}", "info", station)
 
-def rollup_daily_history():
+def rollup_daily_history(station="KOKC"):
     now = okc_local_now()
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-    snapshots = load_json_file(PACING_FILE, {})
+    pacing_file = f"{DATA_DIR}/pacing_{station}.json"
+    history_file = f"{DATA_DIR}/history_{station}.json"
+    snapshots = load_json_file(pacing_file, {})
     if yesterday not in snapshots or not snapshots[yesterday]:
         return
-    history = load_json_file(HISTORY_FILE, {})
+    history = load_json_file(history_file, {})
     if yesterday in history:
         return
     day_snaps = snapshots[yesterday]
@@ -236,16 +246,17 @@ def rollup_daily_history():
         if vals:
             daily_avg[m] = round(sum(vals)/len(vals), 2)
     history[yesterday] = {"avg_pace": daily_avg, "snapshot_count": len(day_snaps), "date": yesterday}
-    save_json_file(HISTORY_FILE, history)
-    add_log(f"Rolled up history for {yesterday} ({len(day_snaps)} snapshots)", "ok")
+    save_json_file(history_file, history)
+    add_log(f"Rolled up history for {yesterday} ({len(day_snaps)} snapshots)", "ok", station)
 
-def build_snapshot_rows():
-    acc = state["accuracy"]
+def build_snapshot_rows(station="KOKC"):
+    st = get_state(station)
+    acc = st["accuracy"]
     models = [m for m in acc.keys() if m != "NWS"] if acc else ALL_KNOWN_MODELS
-    obs_temp = (state["obs"] or {}).get("temperature_display")
+    obs_temp = (st["obs"] or {}).get("temperature_display")
     rows = []
     for model in models:
-        fcst = state["forecasts"].get(model, {})
+        fcst = st["forecasts"].get(model, {})
         current_fcst = fcst.get("current_fcst")
         try:
             pace = round(float(obs_temp) - float(current_fcst), 2) if obs_temp and current_fcst else None
@@ -257,36 +268,41 @@ def build_snapshot_rows():
 def background_loop():
     last_rollup_date = None
     while True:
-        try:
-            t = threading.Thread(target=fetch_all, daemon=True)
-            t.start()
-            t.join(timeout=60)
-            if t.is_alive():
-                add_log("Fetch timed out after 90s", "err")
-            # snapshot now called inside fetch_all
-            now = okc_local_now()
-            today_str = now.strftime("%Y-%m-%d")
-            if now.hour == 1 and last_rollup_date != today_str:
-                rollup_daily_history()
-                last_rollup_date = today_str
-        except Exception as e:
-            add_log(f"Loop error: {e}", "err")
+        for station in STATIONS:
+            try:
+                t = threading.Thread(target=fetch_all, args=(station,), daemon=True)
+                t.start()
+                t.join(timeout=60)
+                if t.is_alive():
+                    add_log("Fetch timed out after 60s", "err", station)
+            except Exception as e:
+                add_log(f"Loop error: {e}", "err", station)
+        now = okc_local_now()
+        today_str = now.strftime("%Y-%m-%d")
+        if now.hour == 1 and last_rollup_date != today_str:
+            for station in STATIONS:
+                rollup_daily_history(station)
+            last_rollup_date = today_str
         time.sleep(REFRESH_SEC)
 
 # ── Routes ────────────────────────────────────────────────────────────────────
-def _get_prev_days(n):
-    history = load_json_file(HISTORY_FILE, {})
+def _get_prev_days(n, station="KOKC"):
+    history = load_json_file(f"{DATA_DIR}/history_{station}.json", {})
     keys = sorted(history.keys(), reverse=True)[:n]
     return [{"date": k, "avg_pace": history[k]["avg_pace"], "snapshot_count": history[k].get("snapshot_count",0)} for k in keys]
 
 @app.route("/api/state")
 def api_state():
-    acc = state["accuracy"]
-    models = active_models()
+    station = request.args.get("station", "KOKC").upper()
+    if station not in STATIONS:
+        station = "KOKC"
+    st = get_state(station)
+    acc = st["accuracy"]
+    models = active_models(station)
     rows = []
     for i, model in enumerate(models):
         a = acc.get(model, {})
-        fcst = state["forecasts"].get(model, {})
+        fcst = st["forecasts"].get(model, {})
         raw = fcst.get("high")
         # Use run-specific correction if available, fall back to overall correction
         current_run = fcst.get("run","")  # e.g. "11Z"
@@ -317,30 +333,39 @@ def api_state():
         except: pass
     consensus = round(w_sum/w_total, 1) if w_total > 0 else None
     return jsonify({
-        "obs": state["obs"], "wethr_high": state["wethr_high"],
+        "station": station, "obs": st["obs"], "wethr_high": st["wethr_high"],
         "rows": rows, "consensus": consensus,
-        "last_updated": state["last_updated"], "errors": state["errors"],
-        "log": state["log"][:30], "models": active_models(),
-        "nws_versions": state["nws_versions"],
-        "today_avg_pace": state["today_avg_pace"],
-        "today_snapshot_count": len(load_json_file(PACING_FILE, {}).get(okc_local_now().strftime("%Y-%m-%d"), [])),
-        "prev_days": _get_prev_days(3),
+        "last_updated": st["last_updated"], "errors": st["errors"],
+        "log": st["log"][:30], "models": active_models(station),
+        "nws_versions": st["nws_versions"],
+        "today_avg_pace": st["today_avg_pace"],
+        "today_snapshot_count": len(load_json_file(f"{DATA_DIR}/pacing_{station}.json", {}).get(okc_local_now().strftime("%Y-%m-%d"), [])),
+        "prev_days": _get_prev_days(3, station),
     })
 
 @app.route("/api/history")
 def api_history():
-    history = load_json_file(HISTORY_FILE, {})
+    station = request.args.get("station", "KOKC").upper()
+    if station not in STATIONS:
+        station = "KOKC"
+    history = load_json_file(f"{DATA_DIR}/history_{station}.json", {})
     return jsonify(history)
 
 @app.route("/api/accuracy", methods=["POST"])
 def save_accuracy():
-    state["accuracy"] = request.json or {}
-    add_log("Accuracy data updated", "ok")
+    station = request.args.get("station", "KOKC").upper()
+    if station not in STATIONS:
+        station = "KOKC"
+    get_state(station)["accuracy"] = request.json or {}
+    add_log("Accuracy data updated", "ok", station)
     return jsonify({"ok": True})
 
 @app.route("/api/refresh", methods=["POST"])
 def manual_refresh():
-    threading.Thread(target=fetch_all, daemon=True).start()
+    station = request.args.get("station", "KOKC").upper()
+    if station not in STATIONS:
+        station = "KOKC"
+    threading.Thread(target=fetch_all, args=(station,), daemon=True).start()
     return jsonify({"ok": True})
 
 @app.route("/")
@@ -433,6 +458,11 @@ input[type=number]:focus{border-color:var(--blue)}
       <div class="lbl">Consensus</div>
       <div class="val" id="h-con" style="color:var(--blue)">--</div>
       <div class="sub2">MAE-weighted</div>
+    </div>
+    <div class="sp"></div>
+    <div style="display:flex;gap:6px;align-items:center">
+      <button id="btn-KOKC" onclick="switchStation('KOKC')" style="background:#1e40af;border:1px solid #3b82f6;color:#93c5fd;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KOKC</button>
+      <button id="btn-KPHL" onclick="switchStation('KPHL')" style="background:none;border:1px solid #334155;color:#64748b;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KPHL</button>
     </div>
     <div class="sp"></div>
     <div style="text-align:right">
@@ -586,12 +616,35 @@ input[type=number]:focus{border-color:var(--blue)}
 </main>
 
 <script>
+var STATION = localStorage.getItem("active_station") || "KOKC";
 var MODELS = [];
 var accData = {};
-try { accData = JSON.parse(localStorage.getItem("kokc_acc") || "{}"); } catch(e){}
+try { accData = JSON.parse(localStorage.getItem("acc_"+STATION) || "{}"); } catch(e){}
 if(Object.keys(accData).length) MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
 var countdown = 300;
 var countdownTimer;
+
+function switchStation(s){
+  STATION = s;
+  localStorage.setItem("active_station", s);
+  // Load this station's accuracy data
+  try { accData = JSON.parse(localStorage.getItem("acc_"+s) || "{}"); } catch(e){ accData = {}; }
+  MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
+  // Update button styles
+  ["KOKC","KPHL"].forEach(function(st){
+    var btn = document.getElementById("btn-"+st);
+    if(st === s){
+      btn.style.background="#1e40af"; btn.style.borderColor="#3b82f6"; btn.style.color="#93c5fd";
+    } else {
+      btn.style.background="none"; btn.style.borderColor="#334155"; btn.style.color="#64748b";
+    }
+  });
+  // Update subtitle
+  var names = {"KOKC":"Oklahoma City Will Rogers World Airport","KPHL":"Philadelphia International Airport"};
+  document.querySelector(".sub").textContent = names[s] || s;
+  document.querySelector("h1").textContent = s + " · Model Tracker";
+  buildForms(); renderPreview(); poll();
+}
 
 var MANUAL_RUNS = ["00Z","03Z","06Z","09Z","12Z","15Z","18Z","21Z"];
 
@@ -655,9 +708,9 @@ function loadFromJSON(){
     if(!keys.length){ status.style.color="var(--red)"; status.textContent="No models found."; return; }
     accData = parsed;
     MODELS = keys.filter(function(m){ return m !== "NWS"; });
-    localStorage.setItem("kokc_acc", JSON.stringify(parsed));
-    localStorage.setItem("kokc_acc_time", new Date().toLocaleString());
-    fetch("/api/accuracy",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(parsed)})
+    localStorage.setItem("acc_"+STATION, JSON.stringify(parsed));
+    localStorage.setItem("acc_"+STATION+"_time", new Date().toLocaleString());
+    fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(parsed)})
       .then(function(){
         status.style.color="var(--green)";
         status.textContent = "Loaded "+keys.length+" models at "+new Date().toLocaleTimeString();
@@ -689,16 +742,16 @@ function saveAccuracy(){
     });
   });
   accData = data;
-  localStorage.setItem("kokc_acc", JSON.stringify(data));
-  fetch("/api/accuracy",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)})
+  localStorage.setItem("acc_"+STATION, JSON.stringify(data));
+  fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)})
     .then(function(){ document.getElementById("save-status").textContent="Saved "+new Date().toLocaleTimeString(); });
 }
 
 function clearAccuracy(){
   if(!confirm("Clear all accuracy data?")) return;
   accData = {}; MODELS = [];
-  localStorage.removeItem("kokc_acc"); localStorage.removeItem("kokc_acc_time");
-  fetch("/api/accuracy",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})});
+  localStorage.removeItem("acc_"+STATION); localStorage.removeItem("acc_"+STATION+"_time");
+  fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})});
   buildForms(); renderPreview();
   document.getElementById("save-status").textContent="Cleared";
 }
@@ -710,7 +763,7 @@ function renderPreview(){
   document.getElementById("acc-loaded").style.display = hasAny ? "inline" : "none";
   if(!hasAny){ el.style.display="none"; return; }
   el.style.display="block";
-  var t = localStorage.getItem("kokc_acc_time");
+  var t = localStorage.getItem("acc_"+STATION+"_time");
   if(t) document.getElementById("acc-loaded-time").textContent="Loaded: "+t;
   var mods = Object.keys(accData);
   document.getElementById("prev-tbody").innerHTML = mods.map(function(m,i){
@@ -890,11 +943,11 @@ function poll(){
   if(Object.keys(accData).length){
     fetch("/api/accuracy",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)});
   }
-  fetch("/api/state").then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error(e); });
+  fetch("/api/state?station="+STATION).then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error(e); });
 }
 
 function manualRefresh(){
-  fetch("/api/refresh",{method:"POST"});
+  fetch("/api/refresh?station="+STATION,{method:"POST"});
   countdown=300;
   setTimeout(poll,3000);
 }
@@ -919,7 +972,7 @@ document.addEventListener("visibilitychange", function(){
 window.addEventListener("focus", function(){ poll(); });
 
 function loadHistory(){
-  fetch("/api/history").then(function(r){ return r.json(); }).then(function(history){
+  fetch("/api/history?station="+STATION).then(function(r){ return r.json(); }).then(function(history){
     var dates = Object.keys(history).sort().reverse();
     var thead = document.getElementById("hist-thead");
     var tbody = document.getElementById("hist-tbody");
@@ -972,6 +1025,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
