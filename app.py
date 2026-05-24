@@ -70,7 +70,7 @@ def wethr_get(path):
     r = requests.get(
         f"https://wethr.net/api/v2/{path}",
         headers={"X-API-Key": API_KEY},
-        timeout=8
+        timeout=6
     )
     r.raise_for_status()
     return r.json()
@@ -155,33 +155,8 @@ def fetch_all():
             errors.append(f"{model}: {e}")
             add_log(f"{model} error: {str(e)[:80]}", "warn")
 
-    # NWS — separate endpoint
-    try:
-        nws_data = wethr_get(f"observations.php?station_code={STATION}&mode=nws_forecast")
-        entries = nws_data if isinstance(nws_data, list) else nws_data.get("forecasts", [])
-        utc_now = datetime.utcnow()
-        versions = {}
-        for entry in entries:
-            ver = str(entry.get("version") or entry.get("forecast_version") or entry.get("run") or "current").lower()
-            vt = parse_vt(entry)
-            if not vt: continue
-            temp_f = get_temp(entry)
-            if temp_f is None: continue
-            if ver not in versions: versions[ver] = []
-            versions[ver].append({"vt": vt, "temp": temp_f})
-        nws_out = {}
-        todays_range = today_entries([{"valid_time": v["vt"].strftime("%Y-%m-%d %H:%M"), "temperature_f": v["temp"]} for vals in versions.values() for v in vals])
-        for ver, pts in versions.items():
-            today_pts = [p for p in pts if any(abs((p["vt"] - parse_vt(t)).total_seconds()) < 1800 for t in todays_range)] or pts
-            if not today_pts: continue
-            high = max(today_pts, key=lambda x: x["temp"])["temp"]
-            closest = min(today_pts, key=lambda x: abs((x["vt"] - utc_now).total_seconds()))
-            nws_out[ver] = {"high": high, "current_fcst": closest["temp"]}
-        state["nws_versions"] = nws_out
-        add_log(f"NWS: {len(nws_out)} versions", "ok")
-    except Exception as e:
-        add_log(f"NWS error: {str(e)[:80]}", "warn")
-        state["nws_versions"] = {}
+    # NWS skipped for now — endpoint TBD
+    state["nws_versions"] = {}
 
     state["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     state["errors"] = errors
@@ -278,7 +253,7 @@ def background_loop():
         try:
             t = threading.Thread(target=fetch_all, daemon=True)
             t.start()
-            t.join(timeout=90)
+            t.join(timeout=60)
             if t.is_alive():
                 add_log("Fetch timed out after 90s", "err")
             add_log("About to save snapshot", "info")
@@ -985,6 +960,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
