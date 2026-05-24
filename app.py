@@ -120,7 +120,7 @@ def fetch_all(station="KOKC"):
 
     # Observation
     try:
-        obs = wethr_get(f"observations.php?station_code={station}&mode=latest")
+        obs = wethr_get(f"observations.php?station_code={STATION}&mode=latest")
         st["obs"] = obs
         add_log(f"Obs: {obs.get('temperature_display')}F", "ok", station)
     except Exception as e:
@@ -129,7 +129,7 @@ def fetch_all(station="KOKC"):
 
     # Wethr high
     try:
-        wh = wethr_get(f"observations.php?station_code={station}&mode=wethr_high&logic=nws")
+        wh = wethr_get(f"observations.php?station_code={STATION}&mode=wethr_high&logic=nws")
         st["wethr_high"] = wh
         add_log(f"Wethr High: {wh.get('wethr_high')}F", "ok", station)
     except Exception as e:
@@ -141,7 +141,7 @@ def fetch_all(station="KOKC"):
     utc_now = datetime.utcnow()
     for model in fetch_targets:
         try:
-            data = wethr_get(f"forecasts.php?location_name={station}&model={requests.utils.quote(model)}&run=latest")
+            data = wethr_get(f"forecasts.php?location_name={STATION}&model={requests.utils.quote(model)}&run=latest")
             temps = data if isinstance(data, list) else data.get("forecasts", [])
             meta = {} if isinstance(data, list) else data
             if temps:
@@ -163,7 +163,7 @@ def fetch_all(station="KOKC"):
             add_log(f"{model} error: {str(e)[:80]}", "warn")
 
     # NWS skipped for now — endpoint TBD
-    state["nws_versions"] = {}
+    st["nws_versions"] = {}
 
     st["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     st["errors"] = errors
@@ -171,8 +171,8 @@ def fetch_all(station="KOKC"):
 
     # Save pacing snapshot here — guaranteed to run after fetch completes
     try:
-        rows = build_snapshot_rows()
-        save_pacing_snapshot(rows)
+        rows = build_snapshot_rows(station)
+        save_pacing_snapshot(rows, station)
     except Exception as e:
         add_log(f"Snapshot error: {e}", "warn", station)
 
@@ -311,7 +311,7 @@ def api_state():
         corr = run_corr if (run_corr not in (None,"")) else overall_corr
         try: adj = round(float(raw) + float(corr), 1) if raw is not None and corr not in (None,"") else None
         except: adj = None
-        obs_temp = (state["obs"] or {}).get("temperature_display")
+        obs_temp = (st["obs"] or {}).get("temperature_display")
         current_fcst = fcst.get("current_fcst")
         try: pace = round(float(obs_temp) - float(current_fcst), 1) if obs_temp and current_fcst else None
         except: pace = None
@@ -941,7 +941,7 @@ function render(data){
 
 function poll(){
   if(Object.keys(accData).length){
-    fetch("/api/accuracy",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)});
+    fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)});
   }
   fetch("/api/state?station="+STATION).then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error(e); });
 }
@@ -1025,6 +1025,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
