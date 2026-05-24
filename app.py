@@ -162,6 +162,13 @@ def fetch_all():
     state["errors"] = errors
     add_log(f"Done. {len(state['forecasts'])} models loaded.", "ok")
 
+    # Save pacing snapshot here — guaranteed to run after fetch completes
+    try:
+        rows = build_snapshot_rows()
+        save_pacing_snapshot(rows)
+    except Exception as e:
+        add_log(f"Snapshot error: {e}", "warn")
+
 def okc_local_now():
     return datetime.utcnow() - timedelta(hours=5)
 
@@ -256,11 +263,7 @@ def background_loop():
             t.join(timeout=60)
             if t.is_alive():
                 add_log("Fetch timed out after 90s", "err")
-            add_log("About to save snapshot", "info")
-            try:
-                save_pacing_snapshot(build_snapshot_rows())
-            except Exception as e:
-                add_log(f"Snapshot error: {e}", "warn")
+            # snapshot now called inside fetch_all
             now = okc_local_now()
             today_str = now.strftime("%Y-%m-%d")
             if now.hour == 1 and last_rollup_date != today_str:
@@ -909,6 +912,12 @@ function startCountdown(){
 
 buildForms(); renderPreview(); poll(); startCountdown(); setInterval(poll,300000);
 
+// Re-poll when tab becomes visible again after being backgrounded
+document.addEventListener("visibilitychange", function(){
+  if(document.visibilityState === "visible"){ poll(); }
+});
+window.addEventListener("focus", function(){ poll(); });
+
 function loadHistory(){
   fetch("/api/history").then(function(r){ return r.json(); }).then(function(history){
     var dates = Object.keys(history).sort().reverse();
@@ -963,6 +972,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
