@@ -120,7 +120,7 @@ def fetch_all(station="KOKC"):
 
     # Observation
     try:
-        obs = wethr_get(f"observations.php?station_code={STATION}&mode=latest")
+        obs = wethr_get(f"observations.php?station_code={station}&mode=latest")
         st["obs"] = obs
         add_log(f"Obs: {obs.get('temperature_display')}F", "ok", station)
     except Exception as e:
@@ -129,7 +129,7 @@ def fetch_all(station="KOKC"):
 
     # Wethr high
     try:
-        wh = wethr_get(f"observations.php?station_code={STATION}&mode=wethr_high&logic=nws")
+        wh = wethr_get(f"observations.php?station_code={station}&mode=wethr_high&logic=nws")
         st["wethr_high"] = wh
         add_log(f"Wethr High: {wh.get('wethr_high')}F", "ok", station)
     except Exception as e:
@@ -141,7 +141,7 @@ def fetch_all(station="KOKC"):
     utc_now = datetime.utcnow()
     for model in fetch_targets:
         try:
-            data = wethr_get(f"forecasts.php?location_name={STATION}&model={requests.utils.quote(model)}&run=latest")
+            data = wethr_get(f"forecasts.php?location_name={station}&model={requests.utils.quote(model)}&run=latest")
             temps = data if isinstance(data, list) else data.get("forecasts", [])
             meta = {} if isinstance(data, list) else data
             if temps:
