@@ -268,15 +268,17 @@ def build_snapshot_rows(station="KOKC"):
 def background_loop():
     last_rollup_date = None
     while True:
+        # Fetch all stations in parallel
+        threads = []
         for station in STATIONS:
-            try:
-                t = threading.Thread(target=fetch_all, args=(station,), daemon=True)
-                t.start()
-                t.join(timeout=60)
-                if t.is_alive():
-                    add_log("Fetch timed out after 60s", "err", station)
-            except Exception as e:
-                add_log(f"Loop error: {e}", "err", station)
+            t = threading.Thread(target=fetch_all, args=(station,), daemon=True)
+            t.start()
+            threads.append((station, t))
+        # Wait for all to complete
+        for station, t in threads:
+            t.join(timeout=90)
+            if t.is_alive():
+                add_log("Fetch timed out after 90s", "err", station)
         now = okc_local_now()
         today_str = now.strftime("%Y-%m-%d")
         if now.hour == 1 and last_rollup_date != today_str:
@@ -1025,6 +1027,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
