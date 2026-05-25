@@ -956,7 +956,10 @@ function poll(){
 function manualRefresh(){
   fetch("/api/refresh?station="+STATION,{method:"POST"});
   countdown=300;
-  setTimeout(poll,3000);
+  document.getElementById("stxt").textContent="Fetching...";
+  // Poll at 8s and 15s to catch whenever the fetch completes
+  setTimeout(poll,8000);
+  setTimeout(poll,15000);
 }
 
 function startCountdown(){
@@ -1032,6 +1035,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
