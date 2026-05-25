@@ -137,7 +137,10 @@ def fetch_all(station="KOKC"):
         add_log(f"Wethr High error: {e}", "err", station)
 
     # Forecasts per model — always fetch all known models so data is ready before accuracy is entered
-    fetch_targets = active_models(station) if st.get("accuracy") else ALL_KNOWN_MODELS
+    fetch_targets = active_models(station)
+    if not fetch_targets:
+        add_log("No accuracy data yet — skipping model fetch", "warn", station)
+        return
     utc_now = datetime.utcnow()
     for model in fetch_targets:
         try:
@@ -268,17 +271,19 @@ def build_snapshot_rows(station="KOKC"):
 def background_loop():
     last_rollup_date = None
     while True:
-        # Fetch all stations in parallel
+        # Fetch stations with slight stagger to avoid rate limiting
         threads = []
-        for station in STATIONS:
+        for i, station in enumerate(STATIONS):
+            if i > 0:
+                time.sleep(10)  # 10s stagger between stations
             t = threading.Thread(target=fetch_all, args=(station,), daemon=True)
             t.start()
             threads.append((station, t))
         # Wait for all to complete
         for station, t in threads:
-            t.join(timeout=90)
+            t.join(timeout=120)
             if t.is_alive():
-                add_log("Fetch timed out after 90s", "err", station)
+                add_log("Fetch timed out after 120s", "err", station)
         now = okc_local_now()
         today_str = now.strftime("%Y-%m-%d")
         if now.hour == 1 and last_rollup_date != today_str:
@@ -1027,6 +1032,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
