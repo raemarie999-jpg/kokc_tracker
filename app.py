@@ -715,9 +715,27 @@ if(Object.keys(accData).length) MODELS = Object.keys(accData).filter(function(m)
 var countdown = 300;
 var countdownTimer;
 
+function clearDisplay(){
+  // Clear all live values so stale data never shows for wrong station
+  ["h-obs","h-wh","h-con","h-tmr","s-obs","s-wh","s-con","s-tmr"].forEach(function(id){
+    var el = document.getElementById(id); if(el) el.textContent="--";
+  });
+  ["h-obs-t","s-obs-t"].forEach(function(id){
+    var el = document.getElementById(id); if(el) el.textContent="awaiting";
+  });
+  var tbody = document.getElementById("main-tbody"); if(tbody) tbody.innerHTML="";
+  var pbars = document.getElementById("pbars"); if(pbars) pbars.innerHTML="";
+  var pace = document.getElementById("pace-card"); if(pace) pace.style.display="none";
+  var avg = document.getElementById("avg-pace-tbody");
+  if(avg) avg.innerHTML='<tr><td colspan="3" style="color:var(--dim)">Accumulating...</td></tr>';
+  document.getElementById("stxt").textContent="Switching...";
+}
+
 function switchStation(s){
   STATION = s;
   localStorage.setItem("active_station", s);
+  // Clear stale display immediately
+  clearDisplay();
   // Load this station's accuracy data
   try { accData = JSON.parse(localStorage.getItem("acc_"+s) || "{}"); } catch(e){ accData = {}; }
   MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
@@ -730,7 +748,7 @@ function switchStation(s){
       btn.style.background="none"; btn.style.borderColor="#334155"; btn.style.color="#64748b";
     }
   });
-  // Update subtitle
+  // Update title
   var names = {"KOKC":"Oklahoma City Will Rogers World Airport","KPHL":"Philadelphia International Airport"};
   document.querySelector(".sub").textContent = names[s] || s;
   document.querySelector("h1").textContent = s + " · Model Tracker";
@@ -1158,6 +1176,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
