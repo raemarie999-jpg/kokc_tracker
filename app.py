@@ -2,6 +2,7 @@ import os, json, time, threading
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, render_template_string
 import requests
+from apscheduler.schedulers.background import BackgroundScheduler
 
 app = Flask(__name__)
 
@@ -296,29 +297,19 @@ def build_snapshot_rows(station="KOKC"):
         rows.append({"model": model, "pace": pace})
     return rows
 
-def background_loop():
-    last_rollup_date = None
-    while True:
-        # Fetch stations with slight stagger to avoid rate limiting
-        threads = []
-        for i, station in enumerate(STATIONS):
-            if i > 0:
-                time.sleep(30)  # 30s stagger between stations
-            t = threading.Thread(target=fetch_all, args=(station,), daemon=True)
-            t.start()
-            threads.append((station, t))
-        # Wait for all to complete
-        for station, t in threads:
-            t.join(timeout=120)
-            if t.is_alive():
-                add_log("Fetch timed out after 120s", "err", station)
-        now = okc_local_now()
-        today_str = now.strftime("%Y-%m-%d")
-        if now.hour == 1 and last_rollup_date != today_str:
-            for station in STATIONS:
-                rollup_daily_history(station)
-            last_rollup_date = today_str
-        time.sleep(REFRESH_SEC)
+def scheduled_fetch():
+    for i, station in enumerate(STATIONS):
+        if i > 0:
+            time.sleep(30)  # stagger stations
+        t = threading.Thread(target=fetch_all, args=(station,), daemon=True)
+        t.start()
+        t.join(timeout=120)
+        if t.is_alive():
+            add_log("Fetch timed out", "err", station)
+
+def scheduled_rollup():
+    for station in STATIONS:
+        rollup_daily_history(station)
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 def _get_prev_days(n, station="KOKC"):
@@ -1181,23 +1172,29 @@ document.querySelectorAll("nav button").forEach(function(btn){
 </html>
 """
 
-_started = False
-_start_lock = threading.Lock()
+_scheduler_started = False
+_scheduler_lock = threading.Lock()
 
-def start_background():
-    global _started
-    with _start_lock:
-        if not _started:
-            _started = True
-            t = threading.Thread(target=background_loop, daemon=True)
-            t.start()
+def start_scheduler():
+    global _scheduler_started
+    with _scheduler_lock:
+        if not _scheduler_started:
+            _scheduler_started = True
+            scheduler = BackgroundScheduler(daemon=True)
+            scheduler.add_job(scheduled_fetch, 'interval', seconds=REFRESH_SEC, id='fetch', max_instances=1)
+            scheduler.add_job(scheduled_rollup, 'cron', hour=1, minute=0, id='rollup')
+            scheduler.start()
+            add_log("Scheduler started", "ok")
+            # Initial fetch
+            threading.Thread(target=scheduled_fetch, daemon=True).start()
 
 with app.app_context():
-    start_background()
+    start_scheduler()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
