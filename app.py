@@ -40,7 +40,7 @@ ALL_KNOWN_MODELS = [
 ]
 RUN_CYCLES = ["00Z","01Z","02Z","03Z","04Z","05Z","06Z","07Z","08Z","09Z","10Z","11Z",
               "12Z","13Z","14Z","15Z","16Z","17Z","18Z","19Z","20Z","21Z","22Z","23Z"]
-REFRESH_SEC = 300
+REFRESH_SEC = 600
 
 def make_state():
     return {
@@ -53,7 +53,6 @@ def make_state():
         "errors": [],
         "log": [],
         "today_avg_pace": {},
-        "consensus_snapshots": [],
         "low_accuracy": {},
     }
 
@@ -147,7 +146,7 @@ def fetch_all(station="KOKC"):
         errors.append(f"WethrHigh: {e}")
         add_log(f"Wethr High error: {e}", "err", station)
 
-    # Forecasts per model — always fetch all known models so data is ready before accuracy is entered
+    # Forecasts per model — only fetch models in accuracy data, skip if none loaded
     fetch_targets = active_models(station)
     if not fetch_targets:
         add_log("No accuracy data yet — skipping model fetch", "warn", station)
@@ -207,13 +206,6 @@ def fetch_all(station="KOKC"):
     except Exception as e:
         add_log(f"Snapshot error: {e}", "warn", station)
 
-    # Save consensus snapshot every 30 minutes
-    try:
-        now_local = okc_local_now()
-        if now_local.minute in (0, 30):
-            save_consensus_snapshot(station)
-    except Exception as e:
-        add_log(f"Consensus snapshot error: {e}", "warn", station)
 
 def okc_local_now():
     return datetime.utcnow() - timedelta(hours=5)
@@ -311,7 +303,7 @@ def background_loop():
         threads = []
         for i, station in enumerate(STATIONS):
             if i > 0:
-                time.sleep(10)  # 10s stagger between stations
+                time.sleep(30)  # 30s stagger between stations
             t = threading.Thread(target=fetch_all, args=(station,), daemon=True)
             t.start()
             threads.append((station, t))
@@ -1206,6 +1198,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
