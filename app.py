@@ -164,16 +164,27 @@ def fetch_all(station="KOKC"):
                 current_temp = get_temp(closest)
                 run_raw = meta.get("run_time") or max_entry.get("run_time") or max_entry.get("run") or ""
                 run_fmt = fmt_run(run_raw)
-                # Tomorrow's high
+                # Tomorrow's high and low
                 tomorrows = tomorrow_entries(temps)
                 tmr_max = max(tomorrows, key=lambda x: get_temp(x) or 0) if tomorrows else None
                 tmr_temp = get_temp(tmr_max) if tmr_max else None
+                tmr_min = min(tomorrows, key=lambda x: get_temp(x) or 999) if tomorrows else None
+                tmr_low = get_temp(tmr_min) if tmr_min else None
+                tmr_low_time = None
+                if tmr_min:
+                    vt = parse_vt(tmr_min)
+                    if vt:
+                        # Convert UTC to OKC local (CDT = UTC-5)
+                        local_vt = vt - timedelta(hours=5)
+                        tmr_low_time = local_vt.strftime("%-I:%M%p").lower()
 
                 st["forecasts"][model] = {
                     "high": raw_temp,
                     "current_fcst": current_temp,
                     "run": run_fmt,
                     "tmr_high": tmr_temp,
+                    "tmr_low": tmr_low,
+                    "tmr_low_time": tmr_low_time,
                 }
                 add_log(f"{model}: high={raw_temp} now={current_temp} run={run_fmt} ({len(todays)} entries)", "ok", station)
         except Exception as e:
@@ -339,8 +350,12 @@ def api_state():
         except: pace = None
         # Tomorrow
         tmr_raw = fcst.get("tmr_high")
+        tmr_low = fcst.get("tmr_low")
+        tmr_low_time = fcst.get("tmr_low_time")
         try: tmr_adj = round(float(tmr_raw) + float(corr), 1) if tmr_raw is not None and corr not in (None,"") else tmr_raw
         except: tmr_adj = tmr_raw
+        try: tmr_low_adj = round(float(tmr_low) + float(corr), 1) if tmr_low is not None and corr not in (None,"") else tmr_low
+        except: tmr_low_adj = tmr_low
 
         rows.append({
             "rank": i+1, "model": model,
@@ -349,6 +364,7 @@ def api_state():
             "corr_source": "run" if (run_corr not in (None,"")) else "overall",
             "adj_high": adj, "pace": pace,
             "tmr_high": tmr_raw, "tmr_adj": tmr_adj,
+            "tmr_low": tmr_low, "tmr_low_adj": tmr_low_adj, "tmr_low_time": tmr_low_time,
             "mae": a.get("mae"), "rmse": a.get("rmse"),
             "runs": a.get("runs", {}),
         })
@@ -548,7 +564,7 @@ input[type=number]:focus{border-color:var(--blue)}
     </div>
     <div style="overflow-x:auto">
       <table>
-        <thead><tr><th>#</th><th>Model</th><th>Run</th><th>Fcst High</th><th>Correction</th><th>Adj High</th><th>Obs Pace</th><th>Tmr High</th><th>Tmr Adj</th><th>MAE</th><th>RMSE</th></tr></thead>
+        <thead><tr><th>#</th><th>Model</th><th>Run</th><th>Fcst High</th><th>Correction</th><th>Adj High</th><th>Obs Pace</th><th>Tmr High</th><th>Tmr Adj</th><th>Tmr Low</th><th>Low Adj</th><th>Low Time</th><th>MAE</th><th>RMSE</th></tr></thead>
         <tbody id="main-tbody"></tbody>
       </table>
     </div>
@@ -863,6 +879,9 @@ function render(data){
       +'<td style="color:'+(r.pace!=null?paceColor(r.pace):"#1e2e42")+'">'+(r.pace!=null?(r.pace>=0?"+":"")+r.pace+"F":"--")+'</td>'
       +'<td style="color:#a78bfa">'+(r.tmr_high!=null?r.tmr_high+"F":"--")+'</td>'
       +'<td style="color:#c4b5fd;font-weight:600">'+(r.tmr_adj!=null?r.tmr_adj+"F":"--")+'</td>'
+      +'<td style="color:#60a5fa">'+(r.tmr_low!=null?r.tmr_low+"F":"--")+'</td>'
+      +'<td style="color:#93c5fd;font-weight:600">'+(r.tmr_low_adj!=null?r.tmr_low_adj+"F":"--")+'</td>'
+      +'<td style="color:var(--dim);font-size:11px">'+(r.tmr_low_time||"--")+'</td>'
       +'<td style="color:'+maeColor(r.mae)+'">'+(r.mae?fmt1(r.mae)+"F":"--")+'</td>'
       +'<td style="color:var(--dim)">'+(r.rmse?fmt1(r.rmse)+"F":"--")+'</td></tr>';
   }).join("");
@@ -1081,6 +1100,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
