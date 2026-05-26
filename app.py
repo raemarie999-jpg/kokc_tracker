@@ -94,13 +94,22 @@ def parse_vt(x):
     try: return datetime.strptime(vt[:16], "%Y-%m-%d %H:%M")
     except: return None
 
-def today_entries(temps):
+def okc_day_bounds(offset=0):
     utc_now = datetime.utcnow()
     okc_local = utc_now - timedelta(hours=5)
-    day_start = okc_local.replace(hour=0,minute=0,second=0,microsecond=0) + timedelta(hours=5)
+    day_start = okc_local.replace(hour=0,minute=0,second=0,microsecond=0) + timedelta(hours=5) + timedelta(days=offset)
     day_end = day_start + timedelta(hours=24)
+    return day_start, day_end
+
+def today_entries(temps):
+    day_start, day_end = okc_day_bounds(0)
     filtered = [x for x in temps if parse_vt(x) is not None and day_start <= parse_vt(x) < day_end]
     return filtered if filtered else temps
+
+def tomorrow_entries(temps):
+    day_start, day_end = okc_day_bounds(1)
+    filtered = [x for x in temps if parse_vt(x) is not None and day_start <= parse_vt(x) < day_end]
+    return filtered
 
 def fmt_run(run_raw):
     try:
@@ -155,10 +164,16 @@ def fetch_all(station="KOKC"):
                 current_temp = get_temp(closest)
                 run_raw = meta.get("run_time") or max_entry.get("run_time") or max_entry.get("run") or ""
                 run_fmt = fmt_run(run_raw)
+                # Tomorrow's high
+                tomorrows = tomorrow_entries(temps)
+                tmr_max = max(tomorrows, key=lambda x: get_temp(x) or 0) if tomorrows else None
+                tmr_temp = get_temp(tmr_max) if tmr_max else None
+
                 st["forecasts"][model] = {
                     "high": raw_temp,
                     "current_fcst": current_temp,
                     "run": run_fmt,
+                    "tmr_high": tmr_temp,
                 }
                 add_log(f"{model}: high={raw_temp} now={current_temp} run={run_fmt} ({len(todays)} entries)", "ok", station)
         except Exception as e:
@@ -322,15 +337,22 @@ def api_state():
         current_fcst = fcst.get("current_fcst")
         try: pace = round(float(obs_temp) - float(current_fcst), 1) if obs_temp and current_fcst else None
         except: pace = None
+        # Tomorrow
+        tmr_raw = fcst.get("tmr_high")
+        try: tmr_adj = round(float(tmr_raw) + float(corr), 1) if tmr_raw is not None and corr not in (None,"") else tmr_raw
+        except: tmr_adj = tmr_raw
+
         rows.append({
             "rank": i+1, "model": model,
             "run": fcst.get("run","—"),
             "raw_high": raw, "correction": corr,
             "corr_source": "run" if (run_corr not in (None,"")) else "overall",
             "adj_high": adj, "pace": pace,
+            "tmr_high": tmr_raw, "tmr_adj": tmr_adj,
             "mae": a.get("mae"), "rmse": a.get("rmse"),
             "runs": a.get("runs", {}),
         })
+    # Today consensus
     w_sum, w_total = 0, 0
     for r in rows:
         try:
@@ -339,12 +361,22 @@ def api_state():
                 w = 1/mae; w_sum += adj*w; w_total += w
         except: pass
     consensus = round(w_sum/w_total, 1) if w_total > 0 else None
+    # Tomorrow consensus
+    tw_sum, tw_total = 0, 0
+    for r in rows:
+        try:
+            mae = float(r["mae"]); tadj = r["tmr_adj"] if r["tmr_adj"] is not None else r["tmr_high"]
+            if mae > 0 and tadj is not None:
+                w = 1/mae; tw_sum += tadj*w; tw_total += w
+        except: pass
+    tmr_consensus = round(tw_sum/tw_total, 1) if tw_total > 0 else None
     return jsonify({
         "station": station, "obs": st["obs"], "wethr_high": st["wethr_high"],
         "rows": rows, "consensus": consensus,
         "last_updated": st["last_updated"], "errors": st["errors"],
         "log": st["log"][:30], "models": active_models(station),
         "nws_versions": st["nws_versions"],
+        "tmr_consensus": tmr_consensus,
         "today_avg_pace": st["today_avg_pace"],
         "today_snapshot_count": len(load_json_file(f"{DATA_DIR}/pacing_{station}.json", {}).get(okc_local_now().strftime("%Y-%m-%d"), [])),
         "prev_days": _get_prev_days(3, station),
@@ -467,6 +499,12 @@ input[type=number]:focus{border-color:var(--blue)}
       <div class="sub2">MAE-weighted</div>
     </div>
     <div class="sp"></div>
+    <div class="stat-pill">
+      <div class="lbl">Tmr Consensus</div>
+      <div class="val" id="h-tmr" style="color:#a78bfa">--</div>
+      <div class="sub2">MAE-weighted</div>
+    </div>
+    <div class="sp"></div>
     <div style="display:flex;gap:6px;align-items:center">
       <button id="btn-KOKC" onclick="switchStation('KOKC')" style="background:#1e40af;border:1px solid #3b82f6;color:#93c5fd;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KOKC</button>
       <button id="btn-KPHL" onclick="switchStation('KPHL')" style="background:none;border:1px solid #334155;color:#64748b;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KPHL</button>
@@ -499,6 +537,7 @@ input[type=number]:focus{border-color:var(--blue)}
     <div class="sc"><div class="lbl">Wethr High</div><div class="v" id="s-wh" style="color:var(--green)">--</div><div class="s">NWS trading day</div></div>
     <div class="sc"><div class="lbl">Consensus High</div><div class="v" id="s-con" style="color:var(--blue)">--</div><div class="s">MAE-weighted adj</div></div>
     <div class="sc"><div class="lbl">Models Live</div><div class="v" id="s-mods" style="color:var(--purple)">--</div><div class="s">forecast runs</div></div>
+    <div class="sc"><div class="lbl">Tmr Consensus</div><div class="v" id="s-tmr" style="color:#a78bfa">--</div><div class="s">MAE-weighted adj</div></div>
   </div>
 
   <div class="card">
@@ -509,7 +548,7 @@ input[type=number]:focus{border-color:var(--blue)}
     </div>
     <div style="overflow-x:auto">
       <table>
-        <thead><tr><th>#</th><th>Model</th><th>Run</th><th>Fcst High</th><th>Correction</th><th>Adj High</th><th>Obs Pace</th><th>MAE</th><th>RMSE</th></tr></thead>
+        <thead><tr><th>#</th><th>Model</th><th>Run</th><th>Fcst High</th><th>Correction</th><th>Adj High</th><th>Obs Pace</th><th>Tmr High</th><th>Tmr Adj</th><th>MAE</th><th>RMSE</th></tr></thead>
         <tbody id="main-tbody"></tbody>
       </table>
     </div>
@@ -804,6 +843,11 @@ function render(data){
   }
   if(wh){ document.getElementById("h-wh").textContent=wh.wethr_high+"F"; document.getElementById("s-wh").textContent=wh.wethr_high+"F"; }
   if(con){ document.getElementById("h-con").textContent=con+"F"; document.getElementById("s-con").textContent=con+"F"; }
+  var tmrCon = data.tmr_consensus;
+  if(tmrCon){
+    document.getElementById("h-tmr").textContent=tmrCon+"F";
+    document.getElementById("s-tmr").textContent=tmrCon+"F";
+  }
   document.getElementById("s-mods").textContent = rows.filter(function(r){ return r.raw_high!=null; }).length+"/"+rows.length;
 
   // Main table
@@ -817,6 +861,8 @@ function render(data){
       +'<td style="color:'+corrColor(r.correction)+'">'+(r.correction!=null&&r.correction!==""?fmtC(r.correction)+(r.corr_source==="run"?' <span style="font-size:9px;color:#38bdf8" title="Run-specific correction">R</span>':''):"--")+'</td>'
       +'<td style="color:var(--green);font-weight:600">'+(r.adj_high!=null?r.adj_high+"F":"--")+'</td>'
       +'<td style="color:'+(r.pace!=null?paceColor(r.pace):"#1e2e42")+'">'+(r.pace!=null?(r.pace>=0?"+":"")+r.pace+"F":"--")+'</td>'
+      +'<td style="color:#a78bfa">'+(r.tmr_high!=null?r.tmr_high+"F":"--")+'</td>'
+      +'<td style="color:#c4b5fd;font-weight:600">'+(r.tmr_adj!=null?r.tmr_adj+"F":"--")+'</td>'
       +'<td style="color:'+maeColor(r.mae)+'">'+(r.mae?fmt1(r.mae)+"F":"--")+'</td>'
       +'<td style="color:var(--dim)">'+(r.rmse?fmt1(r.rmse)+"F":"--")+'</td></tr>';
   }).join("");
@@ -1035,6 +1081,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
