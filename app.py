@@ -4,6 +4,7 @@ from flask import Flask, jsonify, request, render_template_string
 import requests
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # 2MB limit
 
 API_KEY = os.environ.get("WETHR_API_KEY", "")
 DATA_DIR = "/data"
@@ -825,12 +826,18 @@ function loadFromJSON(){
     localStorage.setItem("acc_"+STATION, JSON.stringify(parsed));
     localStorage.setItem("acc_"+STATION+"_time", new Date().toLocaleString());
     fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(parsed)})
-      .then(function(){
+      .then(function(r){
+        if(!r.ok) throw new Error("HTTP "+r.status);
         status.style.color="var(--green)";
         status.textContent = "Loaded "+keys.length+" models at "+new Date().toLocaleTimeString();
         document.getElementById("json-paste").value="";
         buildForms(); renderPreview(); poll();
-      }).catch(function(){ status.style.color="var(--red)"; status.textContent="Server save failed."; });
+      }).catch(function(e){
+        // Data saved locally even if server fails — will sync on next poll
+        status.style.color="var(--yellow)";
+        status.textContent = "Saved locally (server: "+e.message+"). Will sync on next refresh.";
+        buildForms(); renderPreview();
+      });
   } catch(e) {
     status.style.color="var(--red)"; status.textContent="Invalid JSON: "+e.message;
   }
@@ -1200,6 +1207,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
