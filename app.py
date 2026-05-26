@@ -53,6 +53,7 @@ def make_state():
         "errors": [],
         "log": [],
         "today_avg_pace": {},
+        "consensus_snapshots": [],
         "low_accuracy": {},
     }
 
@@ -205,6 +206,14 @@ def fetch_all(station="KOKC"):
         save_pacing_snapshot(rows, station)
     except Exception as e:
         add_log(f"Snapshot error: {e}", "warn", station)
+
+    # Save consensus snapshot every 30 minutes
+    try:
+        now_local = okc_local_now()
+        if now_local.minute in (0, 30):
+            save_consensus_snapshot(station)
+    except Exception as e:
+        add_log(f"Consensus snapshot error: {e}", "warn", station)
 
 def okc_local_now():
     return datetime.utcnow() - timedelta(hours=5)
@@ -1197,6 +1206,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
