@@ -154,6 +154,7 @@ def fetch_all(station="KOKC"):
         return
     utc_now = datetime.utcnow()
     for model in fetch_targets:
+        time.sleep(0.5)
         try:
             data = wethr_get(f"forecasts.php?location_name={station}&model={requests.utils.quote(model)}&run=latest")
             temps = data if isinstance(data, list) else data.get("forecasts", [])
