@@ -435,7 +435,10 @@ def api_low_state():
     st = get_state(station)
     low_acc = st.get("low_accuracy", {})
     rows = []
-    for model, fcst in st["forecasts"].items():
+    # Use low_accuracy models as the source list, fall back to forecasts if no low acc loaded
+    model_list = list(low_acc.keys()) if low_acc else list(st["forecasts"].keys())
+    for model in model_list:
+        fcst = st["forecasts"].get(model, {})
         tmr_low = fcst.get("tmr_low")
         tmr_low_time = fcst.get("tmr_low_time")
         a = low_acc.get(model, {})
@@ -446,7 +449,7 @@ def api_low_state():
         except: adj = None
         rows.append({
             "model": model,
-            "run": current_run,
+            "run": current_run or "--",
             "tmr_low": tmr_low,
             "tmr_low_time": tmr_low_time,
             "correction": corr,
@@ -1285,6 +1288,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
