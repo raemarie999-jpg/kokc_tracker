@@ -380,6 +380,16 @@ def api_state():
                 w = 1/mae; w_sum += adj*w; w_total += w
         except: pass
     consensus = round(w_sum/w_total, 1) if w_total > 0 else None
+    # MAE-weighted consensus pace
+    pw_sum, pw_total = 0, 0
+    for r in rows:
+        try:
+            mae = float(r["mae"])
+            pace = r["pace"]
+            if mae > 0 and pace is not None:
+                w = 1/mae; pw_sum += float(pace)*w; pw_total += w
+        except: pass
+    consensus_pace = round(pw_sum/pw_total, 2) if pw_total > 0 else None
     # Tomorrow consensus
     tw_sum, tw_total = 0, 0
     for r in rows:
@@ -396,6 +406,7 @@ def api_state():
         "log": st["log"][:30], "models": active_models(station),
         "nws_versions": st["nws_versions"],
         "tmr_consensus": tmr_consensus,
+        "consensus_pace": consensus_pace,
         "today_avg_pace": st["today_avg_pace"],
         "today_snapshot_count": len(load_json_file(f"{DATA_DIR}/pacing_{station}.json", {}).get(okc_local_now().strftime("%Y-%m-%d"), [])),
         "prev_days": _get_prev_days(3, station),
@@ -578,6 +589,20 @@ input[type=number]:focus{border-color:var(--blue)}
     <div class="ctitle">Model Pacing vs Current Obs (<span id="pace-obs">--</span>F)</div>
     <div class="pbars" id="pbars"></div>
     <div style="font-size:10px;color:var(--dimmer);margin-top:10px">Pace = current obs minus model forecast for this hour</div>
+  </div>
+
+  <div class="card" id="cons-pace-card" style="display:none">
+    <div class="ctitle">MAE-Weighted Consensus Pace</div>
+    <div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap">
+      <div style="font-size:32px;font-weight:700" id="cons-pace-val">--</div>
+      <div style="color:var(--dim);font-size:12px;line-height:1.6">
+        MAE-weighted average of all model obs paces.<br>
+        Apply to consensus high at your discretion.
+      </div>
+    </div>
+    <div style="margin-top:10px;font-size:11px;color:var(--dim)">
+      Implied adjusted high: <span id="cons-pace-implied" style="color:var(--green);font-weight:600">--</span>
+    </div>
   </div>
 
   <div class="card" id="avg-pace-card">
@@ -998,6 +1023,21 @@ function render(data){
     }).join("");
   }
 
+  // Consensus pace card
+  var consPace = data.consensus_pace;
+  var consPaceCard = document.getElementById("cons-pace-card");
+  if(consPace != null && obs){
+    consPaceCard.style.display = "block";
+    var cpEl = document.getElementById("cons-pace-val");
+    cpEl.textContent = (consPace >= 0 ? "+" : "") + consPace + "F";
+    cpEl.style.color = consPace >= 0 ? "var(--green)" : "var(--red)";
+    // Implied adjusted high = consensus + pace
+    var implied = con ? (Math.round((parseFloat(con) + consPace) * 10) / 10) + "F" : "--";
+    document.getElementById("cons-pace-implied").textContent = implied;
+  } else {
+    consPaceCard.style.display = "none";
+  }
+
   // Today avg pace
   var avgPace = data.today_avg_pace || {};
   var avgModels = Object.keys(avgPace);
@@ -1135,6 +1175,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
