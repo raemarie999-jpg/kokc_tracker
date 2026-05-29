@@ -54,7 +54,6 @@ def make_state():
         "errors": [],
         "log": [],
         "today_avg_pace": {},
-        "low_accuracy": {},
     }
 
 states = {s: make_state() for s in STATIONS}
@@ -420,60 +419,6 @@ def save_accuracy():
     return jsonify({"ok": True})
 
 
-@app.route("/api/low_accuracy", methods=["POST"])
-def api_save_low_accuracy():
-    station = request.args.get("station", "KOKC").upper()
-    if station not in STATIONS: station = "KOKC"
-    data = request.json or {}
-    get_state(station)["low_accuracy"] = data
-    return jsonify({"ok": True, "models": len(data)})
-
-@app.route("/api/low_state")
-def api_low_state():
-    station = request.args.get("station", "KOKC").upper()
-    if station not in STATIONS: station = "KOKC"
-    st = get_state(station)
-    low_acc = st.get("low_accuracy", {})
-    rows = []
-    # Use low_accuracy models as the source list, fall back to forecasts if no low acc loaded
-    model_list = list(low_acc.keys()) if low_acc else list(st["forecasts"].keys())
-    for model in model_list:
-        fcst = st["forecasts"].get(model, {})
-        tmr_low = fcst.get("tmr_low")
-        tmr_low_time = fcst.get("tmr_low_time")
-        a = low_acc.get(model, {})
-        current_run = fcst.get("run", "")
-        run_corr = (a.get("runs") or {}).get(current_run, {}).get("correction")
-        corr = run_corr if run_corr not in (None, "") else a.get("correction")
-        try: adj = round(float(tmr_low) + float(corr), 1) if tmr_low is not None and corr not in (None, "") else None
-        except: adj = None
-        rows.append({
-            "model": model,
-            "run": current_run or "--",
-            "tmr_low": tmr_low,
-            "tmr_low_time": tmr_low_time,
-            "correction": corr,
-            "adj_low": adj,
-            "mae": a.get("mae"),
-        })
-    # MAE-weighted consensus low
-    w_sum, w_total = 0, 0
-    for r in rows:
-        try:
-            mae = float(r["mae"])
-            val = r["adj_low"] if r["adj_low"] is not None else r["tmr_low"]
-            if mae > 0 and val is not None:
-                w = 1/mae; w_sum += val*w; w_total += w
-        except: pass
-    consensus_low = round(w_sum/w_total, 1) if w_total > 0 else None
-    return jsonify({
-        "station": station,
-        "rows": rows,
-        "consensus_low": consensus_low,
-        "low_accuracy_loaded": bool(low_acc),
-        "last_updated": st.get("last_updated"),
-    })
-
 @app.route("/api/refresh", methods=["POST"])
 def manual_refresh():
     station = request.args.get("station", "KOKC").upper()
@@ -601,7 +546,6 @@ input[type=number]:focus{border-color:var(--blue)}
   <button onclick="showTab('runs',this)">&#128336; Run Accuracy</button>
   <button onclick="showTab('log',this)">&#128319; Log</button>
   <button onclick="showTab('history',this)">&#128196; History</button>
-  <button onclick="showTab('lows',this);loadLows();">&#10052; Lows</button>
 </nav>
 
 <main>
@@ -735,35 +679,6 @@ input[type=number]:focus{border-color:var(--blue)}
   </div>
 </div>
 
-<!-- LOWS TAB -->
-<div class="tab" id="tab-lows">
-  <div class="card" style="border-color:#1e3a5f">
-    <div class="ctitle">&#10052; Tomorrow Low Accuracy Import</div>
-    <p style="color:var(--dim);font-size:12px;line-height:1.7;margin-bottom:12px">
-      wethr.net/accuracy &#8594; switch to <strong style="color:var(--blue)">Low</strong> tab &#8594; screenshot &#8594; send to Claude &#8594; paste JSON here.
-    </p>
-    <textarea id="low-paste" placeholder="Paste low accuracy JSON here..." style="width:100%;height:100px;background:#060a0e;border:1px solid #1e3a5f;border-radius:4px;color:var(--text);padding:10px;font-family:inherit;font-size:11px;resize:vertical;outline:none"></textarea>
-    <div style="display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap">
-      <button class="btn" onclick="saveLowAccuracy()">Load Low Accuracy</button>
-      <span class="pill-g" id="low-loaded" style="display:none">Loaded</span>
-      <span style="font-size:10px" id="low-status"></span>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="ctitle">
-      Tomorrow Low Forecasts
-      <span style="color:#a78bfa;font-size:11px;margin-left:8px">Consensus: <span id="low-consensus">--</span></span>
-    </div>
-    <div style="overflow-x:auto">
-      <table>
-        <thead><tr><th>#</th><th>Model</th><th>Run</th><th>Raw Low</th><th>Correction</th><th>Adj Low</th><th>Low Time</th><th>MAE</th></tr></thead>
-        <tbody id="low-tbody"></tbody>
-      </table>
-    </div>
-    <div style="font-size:10px;color:var(--dimmer);margin-top:8px" id="low-updated"></div>
-  </div>
-</div>
 
 </main>
 
@@ -1165,74 +1080,6 @@ document.addEventListener("visibilitychange", function(){
 });
 window.addEventListener("focus", function(){ poll(); });
 
-function saveLowAccuracy(){
-  var raw = document.getElementById("low-paste").value.trim();
-  var status = document.getElementById("low-status");
-  if(!raw){ status.style.color="var(--red)"; status.textContent="Nothing to paste."; return; }
-  try {
-    var parsed = JSON.parse(raw);
-    var keys = Object.keys(parsed);
-    if(!keys.length){ status.style.color="var(--red)"; status.textContent="No models found."; return; }
-    // Save to localStorage first — always works
-    localStorage.setItem("low_acc_"+STATION, JSON.stringify(parsed));
-    // Then try server
-    fetch("/api/low_accuracy?station="+STATION, {
-      method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(parsed)
-    }).then(function(r){ return r.json(); }).then(function(d){
-      status.style.color="var(--green)";
-      status.textContent = "Loaded "+d.models+" models at "+new Date().toLocaleTimeString();
-      document.getElementById("low-paste").value="";
-      document.getElementById("low-loaded").style.display="inline";
-      loadLows();
-    }).catch(function(e){
-      // Server failed but localStorage saved — still works
-      status.style.color="var(--yellow)";
-      status.textContent = "Saved locally — will sync on refresh.";
-      document.getElementById("low-loaded").style.display="inline";
-      loadLows();
-    });
-  } catch(e){
-    status.style.color="var(--red)"; status.textContent="Invalid JSON: "+e.message;
-  }
-}
-
-function loadLows(){
-  // Push localStorage low acc to server first
-  try {
-    var saved = JSON.parse(localStorage.getItem("low_acc_"+STATION)||"{}");
-    if(Object.keys(saved).length){
-      fetch("/api/low_accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(saved)});
-      document.getElementById("low-loaded").style.display="inline";
-    }
-  } catch(e){}
-  // Fetch low state
-  fetch("/api/low_state?station="+STATION)
-    .then(function(r){ return r.json(); })
-    .then(function(data){
-      var rows = data.rows || [];
-      // Sort by tmr_low ascending (coldest first)
-      rows.sort(function(a,b){ return (a.tmr_low||99)-(b.tmr_low||99); });
-      var con = data.consensus_low;
-      document.getElementById("low-consensus").textContent = con ? con+"F" : "--";
-      if(data.last_updated) document.getElementById("low-updated").textContent = "Last updated: "+data.last_updated.slice(11,16);
-      document.getElementById("low-tbody").innerHTML = rows.map(function(r,i){
-        var bg = i%2?"background:#0a1018":"";
-        var cc = corrColor(r.correction);
-        var mc = maeColor(r.mae);
-        return '<tr style="'+bg+'">'
-          +'<td style="color:var(--dim)">#'+(i+1)+'</td>'
-          +'<td style="color:#e8f0f8;font-weight:600">'+r.model+'</td>'
-          +'<td style="color:var(--dim);font-size:11px">'+(r.run||"--")+'</td>'
-          +'<td style="color:#60a5fa">'+(r.tmr_low!=null?r.tmr_low+"F":"--")+'</td>'
-          +'<td style="color:'+cc+'">'+(r.correction!=null&&r.correction!==""?fmtC(r.correction):"--")+'</td>'
-          +'<td style="color:#93c5fd;font-weight:600">'+(r.adj_low!=null?r.adj_low+"F":"--")+'</td>'
-          +'<td style="color:var(--dim);font-size:11px">'+(r.tmr_low_time||"--")+'</td>'
-          +'<td style="color:'+mc+'">'+(r.mae?fmt1(r.mae)+"F":"--")+'</td>'
-          +'</tr>';
-      }).join("");
-    }).catch(function(e){ console.error("Low state error",e); });
-}
-
 function loadHistory(){
   fetch("/api/history?station="+STATION).then(function(r){ return r.json(); }).then(function(history){
     var dates = Object.keys(history).sort().reverse();
@@ -1288,6 +1135,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
