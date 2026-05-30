@@ -1093,7 +1093,7 @@ function syncAccuracy(){
 function poll(){
   fetch("/api/state?station="+STATION)
     .then(function(r){ return r.json(); })
-    .then(render)
+    .then(function(data){ try{ render(data); } catch(e){ document.getElementById("stxt").textContent="Render error: "+e.message; console.error("Render error:",e); } })
     .catch(function(e){ document.getElementById("stxt").textContent="Poll error: "+e.message; });
 }
 function manualRefresh(){
@@ -1113,7 +1113,8 @@ function startCountdown(){
     if(countdown===0){ poll(); countdown=300; }
   },1000);
 }
-buildForms(); renderPreview(); poll(); startCountdown(); setInterval(poll,300000);
+buildForms(); renderPreview(); startCountdown(); setInterval(poll,300000);
+setTimeout(function(){ syncAccuracy(); poll(); }, 100);
 document.addEventListener("visibilitychange", function(){
   if(document.visibilityState === "visible"){ poll(); }
 });
@@ -1218,6 +1219,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
