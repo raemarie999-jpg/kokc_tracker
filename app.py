@@ -131,7 +131,7 @@ def fetch_all(station="KOKC"):
  utc_now = datetime.utcnow()
  for model in fetch_targets:
   try:
-   data = wethr_get(f"forecasts.php?location_name={station}&model={requests.utils.quote(model)}")
+   data = wethr_get(f"forecasts.php?location_name={station}&model={model}")
    temps = data if isinstance(data, list) else data.get("forecasts", [])
    meta = {} if isinstance(data, list) else data
    if temps:
@@ -1181,6 +1181,7 @@ with app.app_context():
 if __name__ == "__main__":
  port = int(os.environ.get("PORT", 5000))
  app.run(host="0.0.0.0", port=port)
+
 
 
 
