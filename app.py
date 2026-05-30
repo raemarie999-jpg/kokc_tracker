@@ -783,7 +783,7 @@ function switchStation(s){
   });
   document.getElementById("h1-sub").textContent = STATION_NAMES[s] || s;
   document.getElementById("h1-title").textContent = s + " \u00b7 Model Tracker";
-  buildForms(); renderPreview(); poll();
+  buildForms(); renderPreview(); syncAccuracy(); poll();
 }
 // Init correct station button on load
 (function(){
@@ -866,7 +866,7 @@ function loadFromJSON(){
         status.style.color="var(--green)";
         status.textContent = "Loaded "+keys.length+" models at "+new Date().toLocaleTimeString();
         document.getElementById("json-paste").value="";
-        buildForms(); renderPreview(); poll();
+        buildForms(); renderPreview(); syncAccuracy(); poll();
       }).catch(function(e){
         status.style.color="var(--yellow)";
         status.textContent = "Saved locally (server: "+e.message+"). Will sync on next refresh.";
@@ -898,7 +898,8 @@ function saveAccuracy(){
   accData = data;
   localStorage.setItem("acc_"+STATION, JSON.stringify(data));
   fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)})
-    .then(function(){ document.getElementById("save-status").textContent="Saved "+new Date().toLocaleTimeString(); });
+    .then(function(){ document.getElementById("save-status").textContent="Saved "+new Date().toLocaleTimeString(); })
+    .catch(function(e){ document.getElementById("save-status").textContent="Save failed: "+e.message; });
 }
 function clearAccuracy(){
   if(!confirm("Clear all accuracy data?")) return;
@@ -1083,11 +1084,17 @@ function render(data){
   document.getElementById("sdot").className = "dot "+(data.errors&&data.errors.length?"dot-yellow":"dot-green");
   document.getElementById("stxt").textContent = data.last_updated?"Updated "+data.last_updated:"No data yet";
 }
-function poll(){
+function syncAccuracy(){
   if(Object.keys(accData).length){
-    fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)});
+    fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)})
+      .catch(function(e){ console.warn("Accuracy sync failed:", e.message); });
   }
-  fetch("/api/state?station="+STATION).then(function(r){ return r.json(); }).then(render).catch(function(e){ document.getElementById("stxt").textContent="Poll error: "+e.message; });
+}
+function poll(){
+  fetch("/api/state?station="+STATION)
+    .then(function(r){ return r.json(); })
+    .then(render)
+    .catch(function(e){ document.getElementById("stxt").textContent="Poll error: "+e.message; });
 }
 function manualRefresh(){
   fetch("/api/refresh?station="+STATION,{method:"POST"});
@@ -1211,6 +1218,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
