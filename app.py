@@ -1211,14 +1211,18 @@ def start_background():
     with _start_lock:
         if not _started:
             _started = True
-            t = threading.Thread(target=background_loop, daemon=True)
+            def delayed_start():
+                time.sleep(5)
+                background_loop()
+            t = threading.Thread(target=delayed_start, daemon=True)
             t.start()
-            print("Background loop started")
+            print("Background loop scheduled")
 with app.app_context():
     start_background()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
