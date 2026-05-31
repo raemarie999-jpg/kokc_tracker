@@ -33,8 +33,8 @@ def save_json_file(path, data):
         add_log(f"Save error {path}: {e}", "err")
         return False
 
-STATIONS = ["KOKC", "KPHL", "KLAS"]
-STATION_NAMES = {"KOKC": "Oklahoma City", "KPHL": "Philadelphia", "KLAS": "Las Vegas"}
+STATIONS = ["KOKC", "KPHL"]
+STATION_NAMES = {"KOKC": "Oklahoma City", "KPHL": "Philadelphia"}
 
 ALL_KNOWN_MODELS = [
     "ARPEGE","HRRR","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NAM-MOS","NBM",
@@ -622,7 +622,7 @@ input[type=number]:focus{border-color:var(--blue)}
     <div style="display:flex;gap:6px;align-items:center">
       <button id="btn-KOKC" onclick="switchStation('KOKC')" style="background:#1e40af;border:1px solid #3b82f6;color:#93c5fd;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KOKC</button>
       <button id="btn-KPHL" onclick="switchStation('KPHL')" style="background:none;border:1px solid #334155;color:#64748b;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KPHL</button>
-      <button id="btn-KLAS" onclick="switchStation('KLAS')" style="background:none;border:1px solid #334155;color:#64748b;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KLAS</button>
+      
     </div>
     <div class="sp"></div>
     <div style="text-align:right">
@@ -843,7 +843,7 @@ function switchStation(s){
   clearDisplay();
   try { accData = JSON.parse(localStorage.getItem("acc_"+s) || "{}"); } catch(e){ accData = {}; }
   MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
-  ["KOKC","KPHL","KLAS"].forEach(function(st){
+  ["KOKC","KPHL"].forEach(function(st){
     var btn = document.getElementById("btn-"+st);
     if(st === s){
       btn.style.background="#1e40af"; btn.style.borderColor="#3b82f6"; btn.style.color="#93c5fd";
@@ -851,7 +851,7 @@ function switchStation(s){
       btn.style.background="none"; btn.style.borderColor="#334155"; btn.style.color="#64748b";
     }
   });
-  var names = {"KOKC":"Oklahoma City Will Rogers World Airport","KPHL":"Philadelphia International Airport","KLAS":"Las Vegas Harry Reid International Airport"};
+  var names = {"KOKC":"Oklahoma City Will Rogers World Airport","KPHL":"Philadelphia International Airport",};
   document.querySelector(".sub").textContent = names[s] || s;
   document.querySelector("h1").textContent = s + " \u00b7 Model Tracker";
   buildForms(); renderPreview(); poll();
@@ -1290,6 +1290,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
