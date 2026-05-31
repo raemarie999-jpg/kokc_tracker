@@ -32,8 +32,9 @@ def save_json_file(path, data):
     except Exception as e:
         add_log(f"Save error {path}: {e}", "err")
         return False
-STATIONS = ["KOKC", "KPHL"]
-STATION_NAMES = {"KOKC": "Oklahoma City", "KPHL": "Philadelphia"}
+
+STATIONS = ["KOKC", "KPHL", "KLAS"]
+STATION_NAMES = {"KOKC": "Oklahoma City", "KPHL": "Philadelphia", "KLAS": "Las Vegas"}
 
 ALL_KNOWN_MODELS = [
     "ARPEGE","HRRR","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NAM-MOS","NBM",
@@ -176,7 +177,6 @@ def fetch_all(station="KOKC"):
                 if tmr_min:
                     vt = parse_vt(tmr_min)
                     if vt:
-                        # Convert UTC to OKC local (CDT = UTC-5)
                         local_vt = vt - timedelta(hours=5)
                         tmr_low_time = local_vt.strftime("%-I:%M%p").lower()
 
@@ -191,7 +191,7 @@ def fetch_all(station="KOKC"):
                 add_log(f"{model}: high={raw_temp} now={current_temp} run={run_fmt} ({len(todays)} entries)", "ok", station)
         except Exception as e:
             errors.append(f"{model}: {e}")
-            add_log(f"{model} error: {str(e)[:80]}", "warn")
+            add_log(f"{model} error: {str(e)[:80]}", "warn", station)
 
     # NWS skipped for now — endpoint TBD
     st["nws_versions"] = {}
@@ -218,7 +218,6 @@ def fetch_all(station="KOKC"):
 def okc_local_now():
     return datetime.utcnow() - timedelta(hours=5)
 
-# In-memory snapshot store — survives across requests, disk is backup only
 _memory_snapshots = {}
 
 def save_pacing_snapshot(rows, station="KOKC"):
@@ -227,18 +226,15 @@ def save_pacing_snapshot(rows, station="KOKC"):
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H:%M")
 
-    # Build entry
     entry = {"time": time_str}
     for r in rows:
         if r.get("pace") is not None:
             entry[r["model"]] = r["pace"]
 
-    # Store in memory
     if date_str not in _memory_snapshots:
         _memory_snapshots[date_str] = []
     _memory_snapshots[date_str].append(entry)
 
-    # Compute rolling average from memory
     avg = {}
     for r in rows:
         m = r["model"]
@@ -247,7 +243,6 @@ def save_pacing_snapshot(rows, station="KOKC"):
             avg[m] = round(sum(vals)/len(vals), 2)
     st["today_avg_pace"] = avg
 
-    # Best-effort disk save for persistence across deploys
     try:
         ensure_data_dir()
         disk = load_json_file(f"{DATA_DIR}/pacing_{station}.json", {})
@@ -317,12 +312,10 @@ def scheduled_fetch():
 def save_consensus_snapshot(station="KOKC"):
     st = get_state(station)
     now = okc_local_now()
-    # Only save between 6AM and 10PM local
     if now.hour < 6 or now.hour >= 22:
         return
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H:%M")
-    # Get current consensus and implied from state
     acc = st.get("accuracy", {})
     forecasts = st.get("forecasts", {})
     models = [m for m in acc.keys() if m != "NWS"]
@@ -343,7 +336,6 @@ def save_consensus_snapshot(station="KOKC"):
             if mae > 0 and adj is not None:
                 w = 1/mae; w_sum += adj*w; w_total += w
         except: pass
-        # Pace
         try:
             current_fcst = fcst.get("current_fcst")
             pace = round(float(obs_temp) - float(current_fcst), 2) if obs_temp and current_fcst else None
@@ -363,14 +355,11 @@ def save_consensus_snapshot(station="KOKC"):
         "pace": cons_pace,
         "obs": float(obs_temp) if obs_temp else None,
     }
-    # Store in memory
     snaps = st["consensus_snapshots"]
-    # Keep only today's
     snaps = [s for s in snaps if s.get("date") == date_str]
     entry["date"] = date_str
     snaps.append(entry)
-    st["consensus_snapshots"] = snaps[-48:]  # max 48 entries (24hrs @ 30min)
-    # Persist to disk
+    st["consensus_snapshots"] = snaps[-48:]
     try:
         ensure_data_dir()
         path = f"{DATA_DIR}/consensus_{station}.json"
@@ -378,7 +367,6 @@ def save_consensus_snapshot(station="KOKC"):
         if date_str not in disk:
             disk[date_str] = []
         disk[date_str].append(entry)
-        # Keep last 90 days
         keys = sorted(disk.keys())
         if len(keys) > 90:
             for k in keys[:-90]: del disk[k]
@@ -401,7 +389,6 @@ def background_loop():
             print(f"Rollup error: {e}")
         time.sleep(REFRESH_SEC)
 
-# ── Routes ────────────────────────────────────────────────────────────────────
 def _get_prev_days(n, station="KOKC"):
     history = load_json_file(f"{DATA_DIR}/history_{station}.json", {})
     keys = sorted(history.keys(), reverse=True)[:n]
@@ -420,8 +407,7 @@ def api_state():
         a = acc.get(model, {})
         fcst = st["forecasts"].get(model, {})
         raw = fcst.get("high")
-        # Use run-specific correction if available, fall back to overall correction
-        current_run = fcst.get("run","")  # e.g. "11Z"
+        current_run = fcst.get("run","")
         run_corr = (a.get("runs") or {}).get(current_run, {}).get("correction")
         overall_corr = a.get("correction")
         corr = run_corr if (run_corr not in (None,"")) else overall_corr
@@ -431,7 +417,6 @@ def api_state():
         current_fcst = fcst.get("current_fcst")
         try: pace = round(float(obs_temp) - float(current_fcst), 1) if obs_temp and current_fcst else None
         except: pace = None
-        # Tomorrow
         tmr_raw = fcst.get("tmr_high")
         tmr_low = fcst.get("tmr_low")
         tmr_low_time = fcst.get("tmr_low_time")
@@ -451,31 +436,37 @@ def api_state():
             "mae": a.get("mae"), "rmse": a.get("rmse"),
             "runs": a.get("runs", {}),
         })
-    # Today consensus
+    def get_mae(r):
+        if r.get("mae") not in (None, ""):
+            try: return float(r["mae"])
+            except: pass
+        run_key = r.get("run", "")
+        rd = (r.get("runs") or {}).get(run_key, {})
+        if rd.get("mae") not in (None, ""):
+            try: return float(rd["mae"])
+            except: pass
+        return None
     w_sum, w_total = 0, 0
     for r in rows:
         try:
-            mae = float(r["mae"]); adj = r["adj_high"] if r["adj_high"] is not None else r["raw_high"]
-            if mae > 0 and adj is not None:
+            mae = get_mae(r); adj = r["adj_high"] if r["adj_high"] is not None else r["raw_high"]
+            if mae and mae > 0 and adj is not None:
                 w = 1/mae; w_sum += adj*w; w_total += w
         except: pass
     consensus = round(w_sum/w_total, 1) if w_total > 0 else None
-    # MAE-weighted consensus pace
     pw_sum, pw_total = 0, 0
     for r in rows:
         try:
-            mae = float(r["mae"])
-            pace = r["pace"]
-            if mae > 0 and pace is not None:
+            mae = get_mae(r); pace = r["pace"]
+            if mae and mae > 0 and pace is not None:
                 w = 1/mae; pw_sum += float(pace)*w; pw_total += w
         except: pass
     consensus_pace = round(pw_sum/pw_total, 2) if pw_total > 0 else None
-    # Tomorrow consensus
     tw_sum, tw_total = 0, 0
     for r in rows:
         try:
-            mae = float(r["mae"]); tadj = r["tmr_adj"] if r["tmr_adj"] is not None else r["tmr_high"]
-            if mae > 0 and tadj is not None:
+            mae = get_mae(r); tadj = r["tmr_adj"] if r["tmr_adj"] is not None else r["tmr_high"]
+            if mae and mae > 0 and tadj is not None:
                 w = 1/mae; tw_sum += tadj*w; tw_total += w
         except: pass
     tmr_consensus = round(tw_sum/tw_total, 1) if tw_total > 0 else None
@@ -509,12 +500,10 @@ def save_accuracy():
     add_log("Accuracy data updated", "ok", station)
     return jsonify({"ok": True})
 
-
 @app.route("/api/consensus_snapshots")
 def api_consensus_snapshots():
     station = request.args.get("station", "KOKC").upper()
     if station not in STATIONS: station = "KOKC"
-    # Return today's in-memory snapshots + disk history
     st = get_state(station)
     today = okc_local_now().strftime("%Y-%m-%d")
     disk = load_json_file(f"{DATA_DIR}/consensus_{station}.json", {})
@@ -633,6 +622,7 @@ input[type=number]:focus{border-color:var(--blue)}
     <div style="display:flex;gap:6px;align-items:center">
       <button id="btn-KOKC" onclick="switchStation('KOKC')" style="background:#1e40af;border:1px solid #3b82f6;color:#93c5fd;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KOKC</button>
       <button id="btn-KPHL" onclick="switchStation('KPHL')" style="background:none;border:1px solid #334155;color:#64748b;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KPHL</button>
+      <button id="btn-KLAS" onclick="switchStation('KLAS')" style="background:none;border:1px solid #334155;color:#64748b;border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px">KLAS</button>
     </div>
     <div class="sp"></div>
     <div style="text-align:right">
@@ -690,10 +680,7 @@ input[type=number]:focus{border-color:var(--blue)}
     <div class="ctitle">MAE-Weighted Consensus Pace</div>
     <div style="display:flex;align-items:baseline;gap:12px;flex-wrap:wrap">
       <div style="font-size:32px;font-weight:700" id="cons-pace-val">--</div>
-      <div style="color:var(--dim);font-size:12px;line-height:1.6">
-        MAE-weighted average of all model obs paces.<br>
-        Apply to consensus high at your discretion.
-      </div>
+      <div style="color:var(--dim);font-size:12px;line-height:1.6">MAE-weighted average of all model obs paces.<br>Apply to consensus high at your discretion.</div>
     </div>
     <div style="margin-top:10px;font-size:11px;color:var(--dim)">
       Implied adjusted high: <span id="cons-pace-implied" style="color:var(--green);font-weight:600">--</span>
@@ -730,9 +717,7 @@ input[type=number]:focus{border-color:var(--blue)}
 <div class="tab" id="tab-entry">
   <div class="card" style="border-color:#1e3a5f">
     <div class="ctitle">Fast Import &mdash; Paste JSON from Claude</div>
-    <p style="color:var(--dim);font-size:12px;line-height:1.7;margin-bottom:12px">
-      Each morning: screenshot accuracy tables, send to Claude, paste JSON here.
-    </p>
+    <p style="color:var(--dim);font-size:12px;line-height:1.7;margin-bottom:12px">Each morning: screenshot accuracy tables, send to Claude, paste JSON here.</p>
     <textarea id="json-paste" placeholder="Paste JSON here..." style="width:100%;height:110px;background:#060a0e;border:1px solid #1e3a5f;border-radius:4px;color:var(--text);padding:10px;font-family:inherit;font-size:11px;resize:vertical;outline:none"></textarea>
     <div style="display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap">
       <button class="btn" onclick="loadFromJSON()">Load JSON</button>
@@ -799,7 +784,6 @@ input[type=number]:focus{border-color:var(--blue)}
   </div>
 </div>
 
-
 <!-- SNAPSHOTS TAB -->
 <div class="tab" id="tab-snapshots">
   <div class="card">
@@ -839,7 +823,6 @@ var countdown = 300;
 var countdownTimer;
 
 function clearDisplay(){
-  // Clear all live values so stale data never shows for wrong station
   ["h-obs","h-wh","h-con","h-tmr","s-obs","s-wh","s-con","s-tmr"].forEach(function(id){
     var el = document.getElementById(id); if(el) el.textContent="--";
   });
@@ -857,13 +840,10 @@ function clearDisplay(){
 function switchStation(s){
   STATION = s;
   localStorage.setItem("active_station", s);
-  // Clear stale display immediately
   clearDisplay();
-  // Load this station's accuracy data
   try { accData = JSON.parse(localStorage.getItem("acc_"+s) || "{}"); } catch(e){ accData = {}; }
   MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
-  // Update button styles
-  ["KOKC","KPHL"].forEach(function(st){
+  ["KOKC","KPHL","KLAS"].forEach(function(st){
     var btn = document.getElementById("btn-"+st);
     if(st === s){
       btn.style.background="#1e40af"; btn.style.borderColor="#3b82f6"; btn.style.color="#93c5fd";
@@ -871,10 +851,9 @@ function switchStation(s){
       btn.style.background="none"; btn.style.borderColor="#334155"; btn.style.color="#64748b";
     }
   });
-  // Update title
-  var names = {"KOKC":"Oklahoma City Will Rogers World Airport","KPHL":"Philadelphia International Airport"};
+  var names = {"KOKC":"Oklahoma City Will Rogers World Airport","KPHL":"Philadelphia International Airport","KLAS":"Las Vegas Harry Reid International Airport"};
   document.querySelector(".sub").textContent = names[s] || s;
-  document.querySelector("h1").textContent = s + " · Model Tracker";
+  document.querySelector("h1").textContent = s + " \u00b7 Model Tracker";
   buildForms(); renderPreview(); poll();
 }
 
@@ -950,7 +929,6 @@ function loadFromJSON(){
         document.getElementById("json-paste").value="";
         buildForms(); renderPreview(); poll();
       }).catch(function(e){
-        // Data saved locally even if server fails — will sync on next poll
         status.style.color="var(--yellow)";
         status.textContent = "Saved locally (server: "+e.message+"). Will sync on next refresh.";
         buildForms(); renderPreview();
@@ -999,8 +977,6 @@ function renderPreview(){
   var el = document.getElementById("acc-preview");
   document.getElementById("acc-badge").style.display = hasAny ? "none" : "inline";
   document.getElementById("acc-loaded").style.display = hasAny ? "inline" : "none";
-
-
   if(!hasAny){ el.style.display="none"; return; }
   el.style.display="block";
   var t = localStorage.getItem("acc_"+STATION+"_time");
@@ -1025,7 +1001,6 @@ function render(data){
   var wh = data.wethr_high;
   var rows = data.rows||[];
   var con = data.consensus;
-
   if(obs){
     var t = obs.temperature_display;
     document.getElementById("h-obs").textContent = t+"F";
@@ -1038,13 +1013,8 @@ function render(data){
   if(wh){ document.getElementById("h-wh").textContent=wh.wethr_high+"F"; document.getElementById("s-wh").textContent=wh.wethr_high+"F"; }
   if(con){ document.getElementById("h-con").textContent=con+"F"; document.getElementById("s-con").textContent=con+"F"; }
   var tmrCon = data.tmr_consensus;
-  if(tmrCon){
-    document.getElementById("h-tmr").textContent=tmrCon+"F";
-    document.getElementById("s-tmr").textContent=tmrCon+"F";
-  }
+  if(tmrCon){ document.getElementById("h-tmr").textContent=tmrCon+"F"; document.getElementById("s-tmr").textContent=tmrCon+"F"; }
   document.getElementById("s-mods").textContent = rows.filter(function(r){ return r.raw_high!=null; }).length+"/"+rows.length;
-
-  // Main table
   document.getElementById("main-tbody").innerHTML = rows.map(function(r,i){
     var bg = i%2?"background:#0a1018":"";
     return '<tr style="'+bg+'">'
@@ -1063,8 +1033,6 @@ function render(data){
       +'<td style="color:'+maeColor(r.mae)+'">'+(r.mae?fmt1(r.mae)+"F":"--")+'</td>'
       +'<td style="color:var(--dim)">'+(r.rmse?fmt1(r.rmse)+"F":"--")+'</td></tr>';
   }).join("");
-
-  // Pacing bars
   var paceRows = rows.filter(function(r){ return r.pace!=null; });
   if(paceRows.length && obs){
     document.getElementById("pace-card").style.display="block";
@@ -1076,8 +1044,6 @@ function render(data){
         +'<span style="font-size:11px;color:'+paceColor(r.pace)+';font-weight:600">'+(p>=0?"+":"")+r.pace+'F</span></div>';
     }).join("");
   }
-
-  // NWS versions
   var nws = data.nws_versions||{};
   var nwsKeys = Object.keys(nws);
   var nwsCard = document.getElementById("nws-card");
@@ -1106,11 +1072,7 @@ function render(data){
         +'<td style="color:#94a3b8">'+(v.current_fcst!=null?v.current_fcst+"F":"--")+'</td>'
         +'<td style="color:'+pc+'">'+ps+'</td></tr>';
     }).join("");
-  } else {
-    nwsCard.style.display="none";
-  }
-
-  // Run accuracy tab
+  } else { nwsCard.style.display="none"; }
   document.getElementById("runview-tbody").innerHTML = rows.map(function(r,i){
     var bg = i%2?"background:#0a1018":"";
     var cells = MANUAL_RUNS.map(function(run){
@@ -1123,8 +1085,6 @@ function render(data){
     }).join("");
     return '<tr style="'+bg+'"><td style="color:#e8f0f8;font-weight:600">'+r.model+'</td>'+cells+'</tr>';
   }).join("");
-
-  // Run cards
   document.getElementById("run-cards").innerHTML = rows.map(function(r){
     var runKey = r.run ? r.run.replace(/[^0-9]/g,"").slice(0,2)+"Z" : "";
     var rd = (r.runs||{})[runKey]||{};
@@ -1136,16 +1096,12 @@ function render(data){
              :'<div style="font-size:10px;color:#2a4060;margin-top:2px">No run corr</div>')
       +'</div>';
   }).join("");
-
-  // Log
   if(data.log&&data.log.length){
     document.getElementById("logbox").innerHTML = data.log.map(function(e){
       var col = e.level==="ok"?"var(--green)":e.level==="err"?"var(--red)":e.level==="warn"?"var(--yellow)":"var(--dim)";
       return '<div style="margin-bottom:5px"><span style="color:var(--dimmer)">['+e.t+']</span> <span style="color:'+col+'">'+e.msg+'</span></div>';
     }).join("");
   }
-
-  // Consensus pace card
   var consPace = data.consensus_pace;
   var consPaceCard = document.getElementById("cons-pace-card");
   if(consPace != null && obs){
@@ -1153,17 +1109,11 @@ function render(data){
     var cpEl = document.getElementById("cons-pace-val");
     cpEl.textContent = (consPace >= 0 ? "+" : "") + consPace + "F";
     cpEl.style.color = consPace >= 0 ? "var(--green)" : "var(--red)";
-    // Implied adjusted high = consensus + pace
     var implied = con ? (Math.round((parseFloat(con) + consPace) * 10) / 10) + "F" : "--";
     document.getElementById("cons-pace-implied").textContent = implied;
-  } else {
-    consPaceCard.style.display = "none";
-  }
-
-  // Today avg pace
+  } else { consPaceCard.style.display = "none"; }
   var avgPace = data.today_avg_pace || {};
   var avgModels = Object.keys(avgPace);
-  var avgCard = document.getElementById("avg-pace-card");
   var todaySnaps = data.today_snapshot_count || 0;
   if(avgModels.length){
     document.getElementById("avg-pace-tbody").innerHTML = avgModels.map(function(m,i){
@@ -1177,10 +1127,7 @@ function render(data){
   } else {
     document.getElementById("avg-pace-tbody").innerHTML = '<tr><td colspan="3" style="color:var(--dim)">Accumulating — updates every 5 min</td></tr>';
   }
-
-  // Prev 3 days
   var prevDays = data.prev_days || [];
-  var prevCard = document.getElementById("prev-days-card");
   if(prevDays.length){
     var allModels = [];
     prevDays.forEach(function(d){ Object.keys(d.avg_pace).forEach(function(m){ if(!allModels.includes(m)) allModels.push(m); }); });
@@ -1198,8 +1145,6 @@ function render(data){
     document.getElementById("prev-days-thead").innerHTML = '';
     document.getElementById("prev-days-tbody").innerHTML = '<tr><td style="color:var(--dim)">No history yet — builds after first full day</td></tr>';
   }
-
-  // Status
   document.getElementById("sdot").className = "dot "+(data.errors&&data.errors.length?"dot-yellow":"dot-green");
   document.getElementById("stxt").textContent = data.last_updated?"Updated "+data.last_updated.slice(11,16):"Live";
 }
@@ -1208,8 +1153,6 @@ function poll(){
   if(Object.keys(accData).length){
     fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)});
   }
-
-
   fetch("/api/state?station="+STATION).then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error(e); });
 }
 
@@ -1217,7 +1160,6 @@ function manualRefresh(){
   fetch("/api/refresh?station="+STATION,{method:"POST"});
   countdown=300;
   document.getElementById("stxt").textContent="Fetching...";
-  // Poll at 8s and 15s to catch whenever the fetch completes
   setTimeout(poll,8000);
   setTimeout(poll,15000);
 }
@@ -1235,8 +1177,6 @@ function startCountdown(){
 
 buildForms(); renderPreview(); poll(); startCountdown(); setInterval(poll,300000);
 
-
-// Re-poll when tab becomes visible again after being backgrounded
 document.addEventListener("visibilitychange", function(){
   if(document.visibilityState === "visible"){ poll(); }
 });
@@ -1249,7 +1189,6 @@ function loadSnapshots(){
     .then(function(r){ return r.json(); })
     .then(function(data){
       _snapData = data.history || {};
-      // Today's snapshots
       var today = data.today || [];
       var tbody = document.getElementById("snap-tbody");
       if(today.length){
@@ -1268,7 +1207,6 @@ function loadSnapshots(){
       } else {
         tbody.innerHTML = '<tr><td colspan="5" style="color:var(--dim)">No snapshots yet today.</td></tr>';
       }
-      // Populate date selector
       var dates = Object.keys(_snapData).sort().reverse();
       var sel = document.getElementById("snap-date-select");
       sel.innerHTML = '<option value="">Select date...</option>' +
@@ -1324,7 +1262,6 @@ function loadHistory(){
   }).catch(function(e){ console.error("History load error",e); });
 }
 
-// Load history when tab is clicked
 document.querySelectorAll("nav button").forEach(function(btn){
   btn.addEventListener("click", function(){
     if(btn.textContent.includes("History")) loadHistory();
@@ -1353,6 +1290,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
