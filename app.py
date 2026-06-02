@@ -425,6 +425,12 @@ def api_state():
         try: tmr_low_adj = round(float(tmr_low) + float(corr), 1) if tmr_low is not None and corr not in (None,"") else tmr_low
         except: tmr_low_adj = tmr_low
 
+        display_mae = a.get("mae")
+        if display_mae is None:
+            run_mae = (a.get("runs") or {}).get(current_run, {}).get("mae")
+            if run_mae not in (None, ""):
+                try: display_mae = float(run_mae)
+                except: pass
         rows.append({
             "rank": i+1, "model": model,
             "run": fcst.get("run","—"),
@@ -433,7 +439,7 @@ def api_state():
             "adj_high": adj, "pace": pace,
             "tmr_high": tmr_raw, "tmr_adj": tmr_adj,
             "tmr_low": tmr_low, "tmr_low_adj": tmr_low_adj, "tmr_low_time": tmr_low_time,
-            "mae": a.get("mae"), "rmse": a.get("rmse"),
+            "mae": display_mae, "rmse": a.get("rmse"),
             "runs": a.get("runs", {}),
         })
     def get_mae(r):
@@ -1401,7 +1407,11 @@ function submitVerification(){
   var date = document.getElementById("verif-date").value;
   var actual = document.getElementById("verif-actual").value;
   var status = document.getElementById("verif-status");
-  if(!date || !actual){ status.style.color="var(--red)"; status.textContent="Date and actual required."; return; }
+  if(!actual){ status.style.color="var(--red)"; status.textContent="Actual value required."; return; }
+  if(!date || date.length < 8){
+    var d2 = new Date(); d2.setDate(d2.getDate()-1);
+    date = d2.toISOString().slice(0,10);
+  }
   fetch("/api/verify?station="+STATION,{
     method:"POST",
     headers:{"Content-Type":"application/json"},
@@ -1466,7 +1476,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
+e
 
 
 
