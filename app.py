@@ -1205,6 +1205,7 @@ function render(data){
 }
 
 function poll(){
+  try { accData = JSON.parse(localStorage.getItem("acc_"+STATION) || "{}"); } catch(e){ accData = {}; }
   if(Object.keys(accData).length){
     fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)});
   }
@@ -1353,4 +1354,5 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
