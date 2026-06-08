@@ -652,37 +652,7 @@ input[type=number]:focus{border-color:var(--blue)}
   <button onclick="showTab('log',this)">&#128319; Log</button>
   <button onclick="showTab('history',this)">&#128196; History</button>
   <button onclick="showTab('snapshots',this);loadSnapshots();">&#128248; Snapshots</button>
-  <button onclick="showTab('sounding',this)">&#127926; Sounding</button>
 </nav>
-
-<!-- SOUNDING -->
-<div class="tab" id="tab-sounding">
-  <div class="card">
-    <div class="ctitle">OUN Norman Sounding &mdash; Latest</div>
-    <p style="color:var(--dim);font-size:11px;margin-bottom:12px">
-      SPC analysis sounding for OUN. Updates several times daily.
-      Boundary layer depth and cap strength directly affect afternoon max temps.
-    </p>
-    <img src="https://www.spc.noaa.gov/exper/soundings/OUN_sf.gif"
-         style="max-width:100%;border:1px solid var(--border);border-radius:6px"
-         onerror="this.style.display='none';document.getElementById('sounding-err').style.display='block'">
-    <div id="sounding-err" style="display:none;color:var(--red);font-size:12px;margin-top:8px">
-      Image unavailable — try <a href="https://www.spc.noaa.gov/exper/soundings/" target="_blank" style="color:var(--blue)">spc.noaa.gov/exper/soundings</a> directly.
-    </div>
-  </div>
-  <div class="card">
-    <div class="ctitle">OUN Norman Sounding &mdash; RAP Analysis</div>
-    <p style="color:var(--dim);font-size:11px;margin-bottom:12px">
-      RAP model analysis sounding. Updates hourly — good for tracking boundary layer evolution through the day.
-    </p>
-    <img src="https://www.spc.noaa.gov/exper/soundings/latest/OUN.gif"
-         style="max-width:100%;border:1px solid var(--border);border-radius:6px"
-         onerror="this.style.display='none';document.getElementById('sounding-err2').style.display='block'">
-    <div id="sounding-err2" style="display:none;color:var(--red);font-size:12px;margin-top:8px">
-      Image unavailable — try <a href="https://www.spc.noaa.gov/exper/soundings/" target="_blank" style="color:var(--blue)">spc.noaa.gov/exper/soundings</a> directly.
-    </div>
-  </div>
-</div>
 
 <main>
 
@@ -1384,5 +1354,7 @@ with app.app_context():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
+
 
 
