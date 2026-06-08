@@ -652,7 +652,37 @@ input[type=number]:focus{border-color:var(--blue)}
   <button onclick="showTab('log',this)">&#128319; Log</button>
   <button onclick="showTab('history',this)">&#128196; History</button>
   <button onclick="showTab('snapshots',this);loadSnapshots();">&#128248; Snapshots</button>
+  <button onclick="showTab('sounding',this)">&#127926; Sounding</button>
 </nav>
+
+<!-- SOUNDING -->
+<div class="tab" id="tab-sounding">
+  <div class="card">
+    <div class="ctitle">OUN Norman Sounding &mdash; 12Z (7AM Local)</div>
+    <p style="color:var(--dim);font-size:11px;margin-bottom:12px">
+      12Z = ~7AM CDT. Shows actual morning atmospheric profile before peak heating.
+      Boundary layer depth and cap strength directly affect afternoon max temps.
+    </p>
+    <img src="https://weather.uwyo.edu/upperair/images/latest/72357OUN_skewt.png"
+         style="max-width:100%;border:1px solid var(--border);border-radius:6px"
+         onerror="this.style.display='none';document.getElementById('sounding-err').style.display='block'">
+    <div id="sounding-err" style="display:none;color:var(--red);font-size:12px;margin-top:8px">
+      Image unavailable — check <a href="https://weather.uwyo.edu/upperair/sounding.html" target="_blank" style="color:var(--blue)">uwyo.edu</a> directly.
+    </div>
+  </div>
+  <div class="card">
+    <div class="ctitle">OUN Norman Sounding &mdash; 00Z (7PM Local / Prior Evening)</div>
+    <p style="color:var(--dim);font-size:11px;margin-bottom:12px">
+      00Z = prior evening. Useful for overnight low context and next-day setup.
+    </p>
+    <img src="https://weather.uwyo.edu/upperair/images/latest/72357OUN_skewt.png?00z"
+         style="max-width:100%;border:1px solid var(--border);border-radius:6px"
+         onerror="this.style.display='none';document.getElementById('sounding-err2').style.display='block'">
+    <div id="sounding-err2" style="display:none;color:var(--red);font-size:12px;margin-top:8px">
+      Image unavailable — check <a href="https://weather.uwyo.edu/upperair/sounding.html" target="_blank" style="color:var(--blue)">uwyo.edu</a> directly.
+    </div>
+  </div>
+</div>
 
 <main>
 
