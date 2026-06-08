@@ -658,28 +658,28 @@ input[type=number]:focus{border-color:var(--blue)}
 <!-- SOUNDING -->
 <div class="tab" id="tab-sounding">
   <div class="card">
-    <div class="ctitle">OUN Norman Sounding &mdash; 12Z (7AM Local)</div>
+    <div class="ctitle">OUN Norman Sounding &mdash; Latest</div>
     <p style="color:var(--dim);font-size:11px;margin-bottom:12px">
-      12Z = ~7AM CDT. Shows actual morning atmospheric profile before peak heating.
+      SPC analysis sounding for OUN. Updates several times daily.
       Boundary layer depth and cap strength directly affect afternoon max temps.
     </p>
-    <img src="https://weather.uwyo.edu/upperair/images/latest/72357OUN_skewt.png"
+    <img src="https://www.spc.noaa.gov/exper/soundings/OUN_sf.gif"
          style="max-width:100%;border:1px solid var(--border);border-radius:6px"
          onerror="this.style.display='none';document.getElementById('sounding-err').style.display='block'">
     <div id="sounding-err" style="display:none;color:var(--red);font-size:12px;margin-top:8px">
-      Image unavailable — check <a href="https://weather.uwyo.edu/upperair/sounding.html" target="_blank" style="color:var(--blue)">uwyo.edu</a> directly.
+      Image unavailable — try <a href="https://www.spc.noaa.gov/exper/soundings/" target="_blank" style="color:var(--blue)">spc.noaa.gov/exper/soundings</a> directly.
     </div>
   </div>
   <div class="card">
-    <div class="ctitle">OUN Norman Sounding &mdash; 00Z (7PM Local / Prior Evening)</div>
+    <div class="ctitle">OUN Norman Sounding &mdash; RAP Analysis</div>
     <p style="color:var(--dim);font-size:11px;margin-bottom:12px">
-      00Z = prior evening. Useful for overnight low context and next-day setup.
+      RAP model analysis sounding. Updates hourly — good for tracking boundary layer evolution through the day.
     </p>
-    <img src="https://weather.uwyo.edu/upperair/images/latest/72357OUN_skewt.png?00z"
+    <img src="https://www.spc.noaa.gov/exper/soundings/latest/OUN.gif"
          style="max-width:100%;border:1px solid var(--border);border-radius:6px"
          onerror="this.style.display='none';document.getElementById('sounding-err2').style.display='block'">
     <div id="sounding-err2" style="display:none;color:var(--red);font-size:12px;margin-top:8px">
-      Image unavailable — check <a href="https://weather.uwyo.edu/upperair/sounding.html" target="_blank" style="color:var(--blue)">uwyo.edu</a> directly.
+      Image unavailable — try <a href="https://www.spc.noaa.gov/exper/soundings/" target="_blank" style="color:var(--blue)">spc.noaa.gov/exper/soundings</a> directly.
     </div>
   </div>
 </div>
