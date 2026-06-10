@@ -1,7 +1,9 @@
 import os, json, time, threading
+from collections import deque
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, render_template_string
 import requests
+import pytz
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # 2MB limit
@@ -43,6 +45,36 @@ RUN_CYCLES = ["00Z","01Z","02Z","03Z","04Z","05Z","06Z","07Z","08Z","09Z","10Z",
               "12Z","13Z","14Z","15Z","16Z","17Z","18Z","19Z","20Z","21Z","22Z","23Z"]
 REFRESH_SEC = 600
 
+# Shared session for connection pooling across all model fetches
+_session = requests.Session()
+
+# In-memory caches to avoid repeated disk reads on every API call
+_history_cache = {}   # station -> {"data": {}, "ts": float}
+_pacing_cache = {}    # station -> {"data": {}, "ts": float}
+_CACHE_TTL = 60       # seconds before re-reading from disk
+
+def get_history(station):
+    c = _history_cache.get(station)
+    if c and (time.time() - c["ts"]) < _CACHE_TTL:
+        return c["data"]
+    data = load_json_file(f"{DATA_DIR}/history_{station}.json", {})
+    _history_cache[station] = {"data": data, "ts": time.time()}
+    return data
+
+def invalidate_history_cache(station):
+    _history_cache.pop(station, None)
+
+def get_pacing(station):
+    c = _pacing_cache.get(station)
+    if c and (time.time() - c["ts"]) < _CACHE_TTL:
+        return c["data"]
+    data = load_json_file(f"{DATA_DIR}/pacing_{station}.json", {})
+    _pacing_cache[station] = {"data": data, "ts": time.time()}
+    return data
+
+def invalidate_pacing_cache(station):
+    _pacing_cache.pop(station, None)
+
 def make_state():
     return {
         "obs": None,
@@ -52,7 +84,7 @@ def make_state():
         "accuracy": {},
         "last_updated": None,
         "errors": [],
-        "log": [],
+        "log": deque(maxlen=100),
         "today_avg_pace": {},
         "consensus_snapshots": [],
     }
@@ -70,12 +102,11 @@ def active_models(station="KOKC"):
 def add_log(msg, level="info", station="KOKC"):
     entry = {"t": datetime.now().strftime("%H:%M:%S"), "msg": msg, "level": level}
     st = get_state(station)
-    st["log"].insert(0, entry)
-    st["log"] = st["log"][:100]
+    st["log"].appendleft(entry)
     print(f"[{station}][{entry['t']}] {msg}")
 
 def wethr_get(path):
-    r = requests.get(
+    r = _session.get(
         f"https://wethr.net/api/v2/{path}",
         headers={"X-API-Key": API_KEY},
         timeout=6
@@ -97,11 +128,11 @@ def parse_vt(x):
     except: return None
 
 def okc_day_bounds(offset=0):
-    utc_now = datetime.utcnow()
-    okc_local = utc_now - timedelta(hours=5)
-    day_start = okc_local.replace(hour=0,minute=0,second=0,microsecond=0) + timedelta(hours=5) + timedelta(days=offset)
-    day_end = day_start + timedelta(hours=24)
-    return day_start, day_end
+    now_local = datetime.now(pytz.utc).astimezone(OKC_TZ).replace(tzinfo=None)
+    day_start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=offset)
+    day_start_utc = OKC_TZ.localize(day_start_local).astimezone(pytz.utc).replace(tzinfo=None)
+    day_end_utc = day_start_utc + timedelta(hours=24)
+    return day_start_utc, day_end_utc
 
 def today_entries(temps):
     day_start, day_end = okc_day_bounds(0)
@@ -176,7 +207,6 @@ def fetch_all(station="KOKC"):
                 if tmr_min:
                     vt = parse_vt(tmr_min)
                     if vt:
-                        # Convert UTC to OKC local (CDT = UTC-5)
                         local_vt = vt - timedelta(hours=5)
                         tmr_low_time = local_vt.strftime("%-I:%M%p").lower()
 
@@ -215,10 +245,14 @@ def fetch_all(station="KOKC"):
         add_log(f"Consensus snapshot error: {e}", "warn", station)
 
 
-def okc_local_now():
-    return datetime.utcnow() - timedelta(hours=5)
+OKC_TZ = pytz.timezone("America/Chicago")
 
-# In-memory snapshot store — survives across requests, disk is backup only
+def okc_local_now():
+    return datetime.now(pytz.utc).astimezone(OKC_TZ).replace(tzinfo=None)
+
+# In-memory snapshot store: date_str -> {model: {"sum": float, "count": int}}
+_memory_snapshot_sums = {}
+# Also keep raw list for disk persistence (bounded to today only)
 _memory_snapshots = {}
 
 def save_pacing_snapshot(rows, station="KOKC"):
@@ -233,24 +267,35 @@ def save_pacing_snapshot(rows, station="KOKC"):
         if r.get("pace") is not None:
             entry[r["model"]] = r["pace"]
 
-    # Store in memory
+    # Store raw entry for disk persistence
     if date_str not in _memory_snapshots:
         _memory_snapshots[date_str] = []
     _memory_snapshots[date_str].append(entry)
 
-    # Compute rolling average from memory
-    avg = {}
+    # Update pre-computed sums (O(1) per model instead of O(N) rescan)
+    if date_str not in _memory_snapshot_sums:
+        _memory_snapshot_sums[date_str] = {}
+    sums = _memory_snapshot_sums[date_str]
     for r in rows:
         m = r["model"]
-        vals = [s[m] for s in _memory_snapshots[date_str] if m in s]
-        if vals:
-            avg[m] = round(sum(vals)/len(vals), 2)
+        p = r.get("pace")
+        if p is not None:
+            if m not in sums:
+                sums[m] = {"sum": 0.0, "count": 0}
+            sums[m]["sum"] += p
+            sums[m]["count"] += 1
+
+    # Compute rolling average from pre-computed sums (O(M) not O(N*M))
+    avg = {}
+    for m, s in sums.items():
+        if s["count"] > 0:
+            avg[m] = round(s["sum"] / s["count"], 2)
     st["today_avg_pace"] = avg
 
     # Best-effort disk save for persistence across deploys
     try:
         ensure_data_dir()
-        disk = load_json_file(f"{DATA_DIR}/pacing_{station}.json", {})
+        disk = get_pacing(station)
         if date_str not in disk:
             disk[date_str] = []
         disk[date_str].append(entry)
@@ -259,6 +304,7 @@ def save_pacing_snapshot(rows, station="KOKC"):
             for k in keys[:-60]:
                 del disk[k]
         save_json_file(f"{DATA_DIR}/pacing_{station}.json", disk)
+        invalidate_pacing_cache(station)
     except Exception as e:
         add_log(f"Disk snapshot error (non-fatal): {e}", "warn", station)
 
@@ -267,12 +313,10 @@ def save_pacing_snapshot(rows, station="KOKC"):
 def rollup_daily_history(station="KOKC"):
     now = okc_local_now()
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
-    pacing_file = f"{DATA_DIR}/pacing_{station}.json"
-    history_file = f"{DATA_DIR}/history_{station}.json"
-    snapshots = load_json_file(pacing_file, {})
+    snapshots = get_pacing(station)
     if yesterday not in snapshots or not snapshots[yesterday]:
         return
-    history = load_json_file(history_file, {})
+    history = get_history(station)
     if yesterday in history:
         return
     day_snaps = snapshots[yesterday]
@@ -285,7 +329,8 @@ def rollup_daily_history(station="KOKC"):
         if vals:
             daily_avg[m] = round(sum(vals)/len(vals), 2)
     history[yesterday] = {"avg_pace": daily_avg, "snapshot_count": len(day_snaps), "date": yesterday}
-    save_json_file(history_file, history)
+    save_json_file(f"{DATA_DIR}/history_{station}.json", history)
+    invalidate_history_cache(station)
     add_log(f"Rolled up history for {yesterday} ({len(day_snaps)} snapshots)", "ok", station)
 
 def build_snapshot_rows(station="KOKC"):
@@ -403,7 +448,7 @@ def background_loop():
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 def _get_prev_days(n, station="KOKC"):
-    history = load_json_file(f"{DATA_DIR}/history_{station}.json", {})
+    history = get_history(station)
     keys = sorted(history.keys(), reverse=True)[:n]
     return [{"date": k, "avg_pace": history[k]["avg_pace"], "snapshot_count": history[k].get("snapshot_count",0)} for k in keys]
 
@@ -483,12 +528,12 @@ def api_state():
         "station": station, "obs": st["obs"], "wethr_high": st["wethr_high"],
         "rows": rows, "consensus": consensus,
         "last_updated": st["last_updated"], "errors": st["errors"],
-        "log": st["log"][:30], "models": active_models(station),
+        "log": list(st["log"])[:30], "models": active_models(station),
         "nws_versions": st["nws_versions"],
         "tmr_consensus": tmr_consensus,
         "consensus_pace": consensus_pace,
         "today_avg_pace": st["today_avg_pace"],
-        "today_snapshot_count": len(load_json_file(f"{DATA_DIR}/pacing_{station}.json", {}).get(okc_local_now().strftime("%Y-%m-%d"), [])),
+        "today_snapshot_count": len(get_pacing(station).get(okc_local_now().strftime("%Y-%m-%d"), [])),
         "prev_days": _get_prev_days(3, station),
     })
 
@@ -497,8 +542,7 @@ def api_history():
     station = request.args.get("station", "KOKC").upper()
     if station not in STATIONS:
         station = "KOKC"
-    history = load_json_file(f"{DATA_DIR}/history_{station}.json", {})
-    return jsonify(history)
+    return jsonify(get_history(station))
 
 @app.route("/api/accuracy", methods=["POST"])
 def save_accuracy():
@@ -514,7 +558,6 @@ def save_accuracy():
 def api_consensus_snapshots():
     station = request.args.get("station", "KOKC").upper()
     if station not in STATIONS: station = "KOKC"
-    # Return today's in-memory snapshots + disk history
     st = get_state(station)
     today = okc_local_now().strftime("%Y-%m-%d")
     disk = load_json_file(f"{DATA_DIR}/consensus_{station}.json", {})
@@ -839,7 +882,6 @@ var countdown = 300;
 var countdownTimer;
 
 function clearDisplay(){
-  // Clear all live values so stale data never shows for wrong station
   ["h-obs","h-wh","h-con","h-tmr","s-obs","s-wh","s-con","s-tmr"].forEach(function(id){
     var el = document.getElementById(id); if(el) el.textContent="--";
   });
@@ -857,12 +899,9 @@ function clearDisplay(){
 function switchStation(s){
   STATION = s;
   localStorage.setItem("active_station", s);
-  // Clear stale display immediately
   clearDisplay();
-  // Load this station's accuracy data
   try { accData = JSON.parse(localStorage.getItem("acc_"+s) || "{}"); } catch(e){ accData = {}; }
   MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
-  // Update button styles
   ["KOKC","KPHL"].forEach(function(st){
     var btn = document.getElementById("btn-"+st);
     if(st === s){
@@ -871,7 +910,6 @@ function switchStation(s){
       btn.style.background="none"; btn.style.borderColor="#334155"; btn.style.color="#64748b";
     }
   });
-  // Update title
   var names = {"KOKC":"Oklahoma City Will Rogers World Airport","KPHL":"Philadelphia International Airport"};
   document.querySelector(".sub").textContent = names[s] || s;
   document.querySelector("h1").textContent = s + " · Model Tracker";
@@ -950,7 +988,6 @@ function loadFromJSON(){
         document.getElementById("json-paste").value="";
         buildForms(); renderPreview(); poll();
       }).catch(function(e){
-        // Data saved locally even if server fails — will sync on next poll
         status.style.color="var(--yellow)";
         status.textContent = "Saved locally (server: "+e.message+"). Will sync on next refresh.";
         buildForms(); renderPreview();
@@ -999,8 +1036,6 @@ function renderPreview(){
   var el = document.getElementById("acc-preview");
   document.getElementById("acc-badge").style.display = hasAny ? "none" : "inline";
   document.getElementById("acc-loaded").style.display = hasAny ? "inline" : "none";
-
-
   if(!hasAny){ el.style.display="none"; return; }
   el.style.display="block";
   var t = localStorage.getItem("acc_"+STATION+"_time");
@@ -1153,7 +1188,6 @@ function render(data){
     var cpEl = document.getElementById("cons-pace-val");
     cpEl.textContent = (consPace >= 0 ? "+" : "") + consPace + "F";
     cpEl.style.color = consPace >= 0 ? "var(--green)" : "var(--red)";
-    // Implied adjusted high = consensus + pace
     var implied = con ? (Math.round((parseFloat(con) + consPace) * 10) / 10) + "F" : "--";
     document.getElementById("cons-pace-implied").textContent = implied;
   } else {
@@ -1163,7 +1197,6 @@ function render(data){
   // Today avg pace
   var avgPace = data.today_avg_pace || {};
   var avgModels = Object.keys(avgPace);
-  var avgCard = document.getElementById("avg-pace-card");
   var todaySnaps = data.today_snapshot_count || 0;
   if(avgModels.length){
     document.getElementById("avg-pace-tbody").innerHTML = avgModels.map(function(m,i){
@@ -1180,7 +1213,6 @@ function render(data){
 
   // Prev 3 days
   var prevDays = data.prev_days || [];
-  var prevCard = document.getElementById("prev-days-card");
   if(prevDays.length){
     var allModels = [];
     prevDays.forEach(function(d){ Object.keys(d.avg_pace).forEach(function(m){ if(!allModels.includes(m)) allModels.push(m); }); });
@@ -1204,35 +1236,28 @@ function render(data){
   document.getElementById("stxt").textContent = data.last_updated?"Updated "+data.last_updated.slice(11,16):"Live";
 }
 
+// KEY FIX: chain /api/state after /api/accuracy completes so MAE values are present
 function poll(){
   try { accData = JSON.parse(localStorage.getItem("acc_"+STATION) || "{}"); } catch(e){ accData = {}; }
-  
   var stateUrl = "/api/state?station="+STATION;
-  
+  function fetchState(){
+    fetch(stateUrl).then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error(e); });
+  }
   if(Object.keys(accData).length){
     fetch("/api/accuracy?station="+STATION, {
       method:"POST",
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify(accData)
-    }).then(function(){
-      fetch(stateUrl).then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error(e); });
-    }).catch(function(){
-      // accuracy POST failed, still try to render whatever state we have
-      fetch(stateUrl).then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error(e); });
-    });
+    }).then(fetchState).catch(fetchState);
   } else {
-    fetch(stateUrl).then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error(e); });
+    fetchState();
   }
-}
-
-  fetch("/api/state?station="+STATION).then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error(e); });
 }
 
 function manualRefresh(){
   fetch("/api/refresh?station="+STATION,{method:"POST"});
   countdown=300;
   document.getElementById("stxt").textContent="Fetching...";
-  // Poll at 8s and 15s to catch whenever the fetch completes
   setTimeout(poll,8000);
   setTimeout(poll,15000);
 }
@@ -1250,8 +1275,6 @@ function startCountdown(){
 
 buildForms(); renderPreview(); poll(); startCountdown(); setInterval(poll,300000);
 
-
-// Re-poll when tab becomes visible again after being backgrounded
 document.addEventListener("visibilitychange", function(){
   if(document.visibilityState === "visible"){ poll(); }
 });
@@ -1264,7 +1287,6 @@ function loadSnapshots(){
     .then(function(r){ return r.json(); })
     .then(function(data){
       _snapData = data.history || {};
-      // Today's snapshots
       var today = data.today || [];
       var tbody = document.getElementById("snap-tbody");
       if(today.length){
@@ -1283,7 +1305,6 @@ function loadSnapshots(){
       } else {
         tbody.innerHTML = '<tr><td colspan="5" style="color:var(--dim)">No snapshots yet today.</td></tr>';
       }
-      // Populate date selector
       var dates = Object.keys(_snapData).sort().reverse();
       var sel = document.getElementById("snap-date-select");
       sel.innerHTML = '<option value="">Select date...</option>' +
@@ -1339,7 +1360,6 @@ function loadHistory(){
   }).catch(function(e){ console.error("History load error",e); });
 }
 
-// Load history when tab is clicked
 document.querySelectorAll("nav button").forEach(function(btn){
   btn.addEventListener("click", function(){
     if(btn.textContent.includes("History")) loadHistory();
@@ -1369,6 +1389,4 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
 
-
-
-
+        
