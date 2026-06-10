@@ -1206,10 +1206,24 @@ function render(data){
 
 function poll(){
   try { accData = JSON.parse(localStorage.getItem("acc_"+STATION) || "{}"); } catch(e){ accData = {}; }
+  
+  var stateUrl = "/api/state?station="+STATION;
+  
   if(Object.keys(accData).length){
-    fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)});
+    fetch("/api/accuracy?station="+STATION, {
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify(accData)
+    }).then(function(){
+      fetch(stateUrl).then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error(e); });
+    }).catch(function(){
+      // accuracy POST failed, still try to render whatever state we have
+      fetch(stateUrl).then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error(e); });
+    });
+  } else {
+    fetch(stateUrl).then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error(e); });
   }
-
+}
 
   fetch("/api/state?station="+STATION).then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error(e); });
 }
