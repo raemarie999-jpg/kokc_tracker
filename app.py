@@ -39,7 +39,6 @@ STATION_NAMES = {
     "KPHL": "Philadelphia International Airport",
     "KDCA": "Washington Reagan National Airport",
 }
-# Standard time UTC offsets (we keep it simple — no DST switching)
 STATION_TZ_OFFSET = {
     "KOKC": -6,
     "KPHL": -5,
@@ -107,18 +106,14 @@ def parse_vt(x):
     try: return datetime.strptime(vt[:16], "%Y-%m-%d %H:%M")
     except: return None
 
-# ── Timezone-aware helpers ────────────────────────────────────────────────────
-
 def station_local_now(station="KOKC"):
     offset = STATION_TZ_OFFSET.get(station, -6)
     return datetime.utcnow() + timedelta(hours=offset)
 
 def station_day_bounds(station="KOKC", offset=0):
-    """Return (day_start_utc, day_end_utc) for today+offset in the station's local time."""
     tz_offset = STATION_TZ_OFFSET.get(station, -6)
     local_now = datetime.utcnow() + timedelta(hours=tz_offset)
     local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=offset)
-    # Convert back to UTC
     day_start_utc = local_midnight - timedelta(hours=tz_offset)
     day_end_utc = day_start_utc + timedelta(hours=24)
     return day_start_utc, day_end_utc
@@ -133,8 +128,6 @@ def tomorrow_entries(temps, station="KOKC"):
     filtered = [x for x in temps if parse_vt(x) is not None and day_start <= parse_vt(x) < day_end]
     return filtered
 
-# ─────────────────────────────────────────────────────────────────────────────
-
 def fmt_run(run_raw):
     try:
         if len(run_raw) >= 13:
@@ -142,6 +135,24 @@ def fmt_run(run_raw):
         return run_raw or "—"
     except:
         return "—"
+
+def get_run_data(acc_model, run_key):
+    """
+    Look up run-specific accuracy data for a model.
+    Priority: exact run match -> 'default' fallback -> empty dict.
+    Returns (run_data_dict, source_label) where source_label is 'run', 'default', or 'overall'.
+    """
+    runs = acc_model.get("runs") or {}
+    # 1. Exact run match
+    rd = runs.get(run_key, {})
+    if rd and (rd.get("mae") or rd.get("correction") not in (None, "")):
+        return rd, "run"
+    # 2. Default fallback run
+    default_rd = runs.get("default", {})
+    if default_rd and (default_rd.get("mae") or default_rd.get("correction") not in (None, "")):
+        return default_rd, "default"
+    # 3. Nothing run-specific found
+    return {}, "overall"
 
 def fetch_all(station="KOKC"):
     st = get_state(station)
@@ -169,7 +180,6 @@ def fetch_all(station="KOKC"):
         errors.append(f"WethrHigh: {e}")
         add_log(f"Wethr High error: {e}", "err", station)
 
-    # Forecasts per model
     fetch_targets = active_models(station)
     if not fetch_targets:
         add_log("No accuracy data yet — skipping model fetch", "warn", station)
@@ -193,7 +203,6 @@ def fetch_all(station="KOKC"):
                 current_temp = get_temp(closest)
                 run_raw = meta.get("run_time") or max_entry.get("run_time") or max_entry.get("run") or ""
                 run_fmt = fmt_run(run_raw)
-                # Tomorrow's high and low
                 tomorrows = tomorrow_entries(temps, station)
                 tmr_max = max(tomorrows, key=lambda x: get_temp(x) or 0) if tomorrows else None
                 tmr_temp = get_temp(tmr_max) if tmr_max else None
@@ -238,7 +247,6 @@ def fetch_all(station="KOKC"):
         add_log(f"Consensus snapshot error: {e}", "warn", station)
 
 
-# In-memory snapshot store
 _memory_snapshots = {}
 
 def save_pacing_snapshot(rows, station="KOKC"):
@@ -352,11 +360,16 @@ def save_consensus_snapshot(station="KOKC"):
         fcst = forecasts.get(model, {})
         raw = fcst.get("high")
         current_run = fcst.get("run", "")
-        run_corr = (a.get("runs") or {}).get(current_run, {}).get("correction")
-        overall_corr = a.get("correction")
-        corr = run_corr if run_corr not in (None, "") else overall_corr
+        # Use the helper with default fallback
+        run_data, _ = get_run_data(a, current_run)
+        corr = run_data.get("correction") if run_data else None
+        if corr in (None, ""):
+            corr = a.get("correction")
         try:
-            mae = float(a.get("mae") or 0)
+            mae_val = run_data.get("mae") if run_data else None
+            if not mae_val:
+                mae_val = a.get("mae")
+            mae = float(mae_val or 0)
             adj = round(float(raw) + float(corr), 1) if raw is not None and corr not in (None, "") else None
             if mae > 0 and adj is not None:
                 w = 1/mae; w_sum += adj*w; w_total += w
@@ -364,7 +377,10 @@ def save_consensus_snapshot(station="KOKC"):
         try:
             current_fcst = fcst.get("current_fcst")
             pace = round(float(obs_temp) - float(current_fcst), 2) if obs_temp and current_fcst else None
-            mae = float(a.get("mae") or 0)
+            mae_val = run_data.get("mae") if run_data else None
+            if not mae_val:
+                mae_val = a.get("mae")
+            mae = float(mae_val or 0)
             if mae > 0 and pace is not None:
                 w = 1/mae; pw_sum += float(pace)*w; pw_total += w
         except: pass
@@ -414,7 +430,6 @@ def background_loop():
             print(f"Rollup error: {e}")
         time.sleep(REFRESH_SEC)
 
-# ── Routes ────────────────────────────────────────────────────────────────────
 def _get_prev_days(n, station="KOKC"):
     history = load_json_file(f"{DATA_DIR}/history_{station}.json", {})
     keys = sorted(history.keys(), reverse=True)[:n]
@@ -434,9 +449,19 @@ def api_state():
         fcst = st["forecasts"].get(model, {})
         raw = fcst.get("high")
         current_run = fcst.get("run","")
-        run_corr = (a.get("runs") or {}).get(current_run, {}).get("correction")
-        overall_corr = a.get("correction")
-        corr = run_corr if (run_corr not in (None,"")) else overall_corr
+
+        # Use helper: exact run -> default fallback -> overall
+        run_data, corr_source = get_run_data(a, current_run)
+        corr = run_data.get("correction") if run_data else None
+        display_mae = run_data.get("mae") if run_data else None
+
+        if corr in (None, ""):
+            corr = a.get("correction")
+            if corr not in (None, ""):
+                corr_source = "overall"
+        if not display_mae:
+            display_mae = a.get("mae")
+
         try: adj = round(float(raw) + float(corr), 1) if raw is not None and corr not in (None,"") else None
         except: adj = None
         obs_temp = (st["obs"] or {}).get("temperature_display")
@@ -455,13 +480,14 @@ def api_state():
             "rank": i+1, "model": model,
             "run": fcst.get("run","—"),
             "raw_high": raw, "correction": corr,
-            "corr_source": "run" if (run_corr not in (None,"")) else "overall",
+            "corr_source": corr_source,   # "run", "default", or "overall"
             "adj_high": adj, "pace": pace,
             "tmr_high": tmr_raw, "tmr_adj": tmr_adj,
             "tmr_low": tmr_low, "tmr_low_adj": tmr_low_adj, "tmr_low_time": tmr_low_time,
-            "mae": a.get("mae"), "rmse": a.get("rmse"),
+            "mae": display_mae, "rmse": a.get("rmse"),
             "runs": a.get("runs", {}),
         })
+
     w_sum, w_total = 0, 0
     for r in rows:
         try:
@@ -515,6 +541,7 @@ def save_accuracy():
         station = "KOKC"
     get_state(station)["accuracy"] = request.json or {}
     add_log("Accuracy data updated", "ok", station)
+    save_json_file(f"{DATA_DIR}/accuracy_{station}.json", request.json or {})
     return jsonify({"ok": True})
 
 @app.route("/api/consensus_snapshots")
@@ -554,6 +581,7 @@ HTML = """<!DOCTYPE html>
   --bg:#080c10;--bg2:#0e1520;--bg3:#0b1118;--border:#1a2535;
   --text:#c9d4e0;--dim:#4a6080;--dimmer:#2a3a50;
   --blue:#38bdf8;--green:#4ade80;--yellow:#facc15;--red:#f87171;--purple:#c084fc;
+  --orange:#fb923c;
 }
 body{background:var(--bg);color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:13px;min-height:100vh}
 header{background:var(--bg3);border-bottom:1px solid var(--border);padding:14px 20px;
@@ -605,6 +633,9 @@ input[type=number]:focus{border-color:var(--blue)}
 .stn-btn{border-radius:4px;padding:5px 12px;font-size:11px;cursor:pointer;font-family:inherit;letter-spacing:1px;transition:all .15s}
 .stn-btn.active{background:#1e40af;border:1px solid #3b82f6;color:#93c5fd}
 .stn-btn.inactive{background:none;border:1px solid #334155;color:#64748b}
+/* Default run column highlight */
+.default-col{background:#fb923c0d !important}
+th.default-col{color:var(--orange) !important}
 </style>
 </head>
 <body>
@@ -745,6 +776,34 @@ input[type=number]:focus{border-color:var(--blue)}
     </div>
   </div>
 
+  <!-- DEFAULT FALLBACK ENTRY -->
+  <div class="card" style="border-color:#3a2a0a">
+    <div class="ctitle" style="color:var(--orange)">&#9888; Default / Fallback Run Values</div>
+    <p style="color:var(--dim);font-size:12px;line-height:1.7;margin-bottom:12px">
+      Set a fallback MAE &amp; Correction per model. These apply automatically whenever a model's active run
+      has <em>no</em> run-specific entry — keeping it out of consensus rather than polluting it with uncalibrated data.
+      <br><span style="color:var(--orange)">D</span> badge in the dashboard Correction column indicates the default is active.
+    </p>
+    <div style="overflow-x:auto">
+      <table>
+        <thead>
+          <tr>
+            <th>Model</th>
+            <th style="color:var(--orange)">Default MAE</th>
+            <th style="color:var(--orange)">Default Correction</th>
+            <th style="color:var(--dim);font-size:9px">Named Runs</th>
+          </tr>
+        </thead>
+        <tbody id="default-tbody"></tbody>
+      </table>
+    </div>
+    <div style="display:flex;gap:10px;align-items:center;margin-top:14px;flex-wrap:wrap">
+      <button class="btn btn-green" onclick="saveDefaults()">Save Defaults</button>
+      <button class="btn btn-red" onclick="clearDefaults()">Clear Defaults</button>
+      <span style="font-size:10px;color:var(--dim)" id="default-status"></span>
+    </div>
+  </div>
+
   <details style="margin-bottom:16px">
     <summary style="cursor:pointer;color:var(--dim);font-size:11px;letter-spacing:1px;padding:10px 0;list-style:none">&#9658; Manual entry (fallback)</summary>
     <div style="margin-top:12px">
@@ -768,7 +827,7 @@ input[type=number]:focus{border-color:var(--blue)}
 
   <div class="card" id="acc-preview" style="display:none">
     <div class="ctitle">Currently Loaded</div>
-    <div style="overflow-x:auto"><table><thead><tr><th>Model</th><th>MAE</th><th>Correction</th><th>RMSE</th><th>Runs</th></tr></thead><tbody id="prev-tbody"></tbody></table></div>
+    <div style="overflow-x:auto"><table><thead><tr><th>Model</th><th>MAE</th><th>Correction</th><th>RMSE</th><th>Default MAE</th><th>Default Corr</th><th>Named Runs</th></tr></thead><tbody id="prev-tbody"></tbody></table></div>
     <div style="margin-top:10px;display:flex;gap:10px;align-items:center">
       <button class="btn btn-red" onclick="clearAccuracy()">Clear All</button>
       <span style="font-size:10px;color:var(--dim)" id="acc-loaded-time"></span>
@@ -779,8 +838,8 @@ input[type=number]:focus{border-color:var(--blue)}
 <!-- RUN ACCURACY -->
 <div class="tab" id="tab-runs">
   <div class="card">
-    <div class="ctitle">Run-Specific Accuracy</div>
-    <div style="overflow-x:auto"><table><thead><tr><th>Model</th><th>00Z</th><th>03Z</th><th>06Z</th><th>09Z</th><th>12Z</th><th>15Z</th><th>18Z</th><th>21Z</th></tr></thead><tbody id="runview-tbody"></tbody></table></div>
+    <div class="ctitle">Run-Specific Accuracy (including Default fallback)</div>
+    <div style="overflow-x:auto"><table><thead><tr><th>Model</th><th class="default-col">DEFAULT</th><th>00Z</th><th>03Z</th><th>06Z</th><th>09Z</th><th>12Z</th><th>15Z</th><th>18Z</th><th>21Z</th></tr></thead><tbody id="runview-tbody"></tbody></table></div>
     <div class="ctitle" style="margin-top:20px">Current Run per Model</div>
     <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:8px" id="run-cards"></div>
   </div>
@@ -850,7 +909,6 @@ if(Object.keys(accData).length) MODELS = Object.keys(accData).filter(function(m)
 var countdown = 300;
 var countdownTimer;
 
-// Build station switcher buttons dynamically
 (function(){
   var container = document.getElementById("station-btns");
   STATION_LIST.forEach(function(s){
@@ -895,7 +953,7 @@ function switchStation(s){
   updateStationButtons();
   document.getElementById("page-sub").textContent = STATION_NAMES[s] || s;
   document.getElementById("page-title").textContent = s + " \u00b7 Model Tracker";
-  buildForms(); renderPreview(); poll();
+  buildForms(); buildDefaultForm(); renderPreview(); poll();
 }
 
 var MANUAL_RUNS = ["00Z","03Z","06Z","09Z","12Z","15Z","18Z","21Z"];
@@ -950,6 +1008,69 @@ function buildForms(){
   }).join("");
 }
 
+// --- DEFAULT FALLBACK FORM ---
+function buildDefaultForm(){
+  var mods = MODELS.length ? MODELS : ["HRRR","ARPEGE","NAM","UKMO","LAV-MOS","RAP","GEM-GDPS","NAM-MOS","NBM","NAM4KM"];
+  var tbody = document.getElementById("default-tbody");
+  if(!tbody) return;
+  tbody.innerHTML = mods.map(function(m,i){
+    var a = accData[m]||{};
+    var rd = (a.runs||{})["default"]||{};
+    var bg = i%2?"background:#0a1018":"";
+    var namedRuns = Object.keys(a.runs||{}).filter(function(r){ return r!=="default"; }).join(", ")||"none";
+    return '<tr style="'+bg+'">'
+      +'<td style="color:#e8f0f8;font-weight:600">'+m+'</td>'
+      +'<td class="default-col"><input type="number" step="0.1" placeholder="e.g. 1.5" style="width:80px" id="def-mae-'+m+'" value="'+(rd.mae||"")+'"></td>'
+      +'<td class="default-col"><input type="number" step="0.1" placeholder="e.g. +0.5" style="width:80px" id="def-corr-'+m+'" value="'+(rd.correction||"")+'"></td>'
+      +'<td style="color:var(--dim);font-size:11px">'+namedRuns+'</td>'
+      +'</tr>';
+  }).join("");
+}
+
+function saveDefaults(){
+  var mods = MODELS.length ? MODELS : [];
+  var status = document.getElementById("default-status");
+  mods.forEach(function(m){
+    if(!accData[m]) accData[m] = {};
+    if(!accData[m].runs) accData[m].runs = {};
+    var maeEl = document.getElementById("def-mae-"+m);
+    var corrEl = document.getElementById("def-corr-"+m);
+    var mae = maeEl ? maeEl.value : "";
+    var corr = corrEl ? corrEl.value : "";
+    if(mae || corr){
+      accData[m].runs["default"] = { mae: mae, correction: corr };
+    } else {
+      delete accData[m].runs["default"];
+    }
+  });
+  localStorage.setItem("acc_"+STATION, JSON.stringify(accData));
+  fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)})
+    .then(function(r){ return r.json(); })
+    .then(function(){
+      status.style.color="var(--green)";
+      status.textContent = "Defaults saved at "+new Date().toLocaleTimeString();
+      renderPreview();
+    }).catch(function(e){
+      localStorage.setItem("acc_"+STATION, JSON.stringify(accData));
+      status.style.color="var(--yellow)";
+      status.textContent = "Saved locally (server: "+e.message+")";
+      renderPreview();
+    });
+}
+
+function clearDefaults(){
+  if(!confirm("Clear all default fallback values?")) return;
+  var mods = MODELS.length ? MODELS : [];
+  mods.forEach(function(m){
+    if(accData[m] && accData[m].runs) delete accData[m].runs["default"];
+  });
+  localStorage.setItem("acc_"+STATION, JSON.stringify(accData));
+  fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)});
+  buildDefaultForm();
+  document.getElementById("default-status").textContent = "Defaults cleared";
+  renderPreview();
+}
+
 function loadFromJSON(){
   var raw = document.getElementById("json-paste").value.trim();
   var status = document.getElementById("json-status");
@@ -958,6 +1079,15 @@ function loadFromJSON(){
     var parsed = JSON.parse(raw);
     var keys = Object.keys(parsed);
     if(!keys.length){ status.style.color="var(--red)"; status.textContent="No models found."; return; }
+    // Preserve existing default run values when importing new JSON
+    keys.forEach(function(m){
+      if(accData[m] && accData[m].runs && accData[m].runs["default"]){
+        if(!parsed[m].runs) parsed[m].runs = {};
+        if(!parsed[m].runs["default"]){
+          parsed[m].runs["default"] = accData[m].runs["default"];
+        }
+      }
+    });
     accData = parsed;
     MODELS = keys.filter(function(m){ return m !== "NWS"; });
     localStorage.setItem("acc_"+STATION, JSON.stringify(parsed));
@@ -968,11 +1098,11 @@ function loadFromJSON(){
         status.style.color="var(--green)";
         status.textContent = "Loaded "+keys.length+" models at "+new Date().toLocaleTimeString();
         document.getElementById("json-paste").value="";
-        buildForms(); renderPreview(); poll();
+        buildForms(); buildDefaultForm(); renderPreview(); poll();
       }).catch(function(e){
         status.style.color="var(--yellow)";
         status.textContent = "Saved locally (server: "+e.message+"). Will sync on next refresh.";
-        buildForms(); renderPreview();
+        buildForms(); buildDefaultForm(); renderPreview();
       });
   } catch(e) {
     status.style.color="var(--red)"; status.textContent="Invalid JSON: "+e.message;
@@ -997,6 +1127,10 @@ function saveAccuracy(){
         correction: corr_el ? corr_el.value : ""
       };
     });
+    // Preserve defaults when saving manual entries
+    if(accData[m] && accData[m].runs && accData[m].runs["default"]){
+      data[m].runs["default"] = accData[m].runs["default"];
+    }
   });
   accData = data;
   localStorage.setItem("acc_"+STATION, JSON.stringify(data));
@@ -1009,7 +1143,7 @@ function clearAccuracy(){
   accData = {}; MODELS = [];
   localStorage.removeItem("acc_"+STATION); localStorage.removeItem("acc_"+STATION+"_time");
   fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})});
-  buildForms(); renderPreview();
+  buildForms(); buildDefaultForm(); renderPreview();
   document.getElementById("save-status").textContent="Cleared";
 }
 
@@ -1025,14 +1159,17 @@ function renderPreview(){
   var mods = Object.keys(accData);
   document.getElementById("prev-tbody").innerHTML = mods.map(function(m,i){
     var a = accData[m]||{};
-    var runs = Object.entries(a.runs||{}).filter(function(e){ return e[1].mae||e[1].correction; }).map(function(e){ return e[0]; }).join(", ")||"--";
+    var defRd = (a.runs||{})["default"]||{};
+    var namedRuns = Object.keys(a.runs||{}).filter(function(r){ return r!=="default"; }).filter(function(r){ return (a.runs||{})[r].mae||(a.runs||{})[r].correction; }).join(", ")||"--";
     var bg = i%2?"background:#0a1018":"";
     return '<tr style="'+bg+'">'
       +'<td style="color:#e8f0f8;font-weight:600">'+m+'</td>'
       +'<td style="color:'+maeColor(a.mae)+'">'+(a.mae?fmt1(a.mae)+"F":"--")+'</td>'
       +'<td style="color:'+corrColor(a.correction)+'">'+(a.correction!=null&&a.correction!==""?fmtC(a.correction):"--")+'</td>'
       +'<td style="color:var(--dim)">'+(a.rmse?fmt1(a.rmse)+"F":"--")+'</td>'
-      +'<td style="color:var(--dim);font-size:11px">'+runs+'</td></tr>';
+      +'<td style="color:'+(defRd.mae?maeColor(defRd.mae):"var(--dimmer)")+'">'+(defRd.mae?fmt1(defRd.mae)+"F":'<span style="color:#2a3a50">—</span>')+'</td>'
+      +'<td style="color:'+(defRd.correction!=null&&defRd.correction!==""?corrColor(defRd.correction):"var(--dimmer)")+'">'+(defRd.correction!=null&&defRd.correction!==""?fmtC(defRd.correction):'<span style="color:#2a3a50">—</span>')+'</td>'
+      +'<td style="color:var(--dim);font-size:11px">'+namedRuns+'</td></tr>';
   }).join("");
 }
 
@@ -1063,12 +1200,16 @@ function render(data){
 
   document.getElementById("main-tbody").innerHTML = rows.map(function(r,i){
     var bg = i%2?"background:#0a1018":"";
+    // Correction source badge
+    var corrBadge = "";
+    if(r.corr_source === "run") corrBadge = ' <span style="font-size:9px;color:#38bdf8" title="Run-specific correction">R</span>';
+    else if(r.corr_source === "default") corrBadge = ' <span style="font-size:9px;color:var(--orange);font-weight:700" title="Using default fallback">D</span>';
     return '<tr style="'+bg+'">'
       +'<td style="color:var(--dim)">#'+r.rank+'</td>'
       +'<td style="color:#e8f0f8;font-weight:600">'+r.model+'</td>'
       +'<td style="color:var(--dim);font-size:11px">'+(r.run||"--")+'</td>'
       +'<td style="color:var(--yellow)">'+(r.raw_high!=null?r.raw_high+"F":"--")+'</td>'
-      +'<td style="color:'+corrColor(r.correction)+'">'+(r.correction!=null&&r.correction!==""?fmtC(r.correction)+(r.corr_source==="run"?' <span style="font-size:9px;color:#38bdf8" title="Run-specific correction">R</span>':''):"--")+'</td>'
+      +'<td style="color:'+corrColor(r.correction)+'">'+(r.correction!=null&&r.correction!==""?fmtC(r.correction)+corrBadge:"--")+'</td>'
       +'<td style="color:var(--green);font-weight:600">'+(r.adj_high!=null?r.adj_high+"F":"--")+'</td>'
       +'<td style="color:'+(r.pace!=null?paceColor(r.pace):"#1e2e42")+'">'+(r.pace!=null?(r.pace>=0?"+":"")+r.pace+"F":"--")+'</td>'
       +'<td style="color:#a78bfa">'+(r.tmr_high!=null?r.tmr_high+"F":"--")+'</td>'
@@ -1123,8 +1264,16 @@ function render(data){
     nwsCard.style.display="none";
   }
 
+  // Run Accuracy tab — includes DEFAULT column
   document.getElementById("runview-tbody").innerHTML = rows.map(function(r,i){
     var bg = i%2?"background:#0a1018":"";
+    var defRd = (r.runs||{})["default"]||{};
+    var defCell = (defRd.mae||defRd.correction)
+      ?'<td class="default-col" style="text-align:center"><div style="line-height:1.8">'
+        +(defRd.mae?'<div style="color:'+maeColor(defRd.mae)+'">'+fmt1(defRd.mae)+'F</div>':'')
+        +(defRd.correction!=null&&defRd.correction!==""?'<div style="color:'+corrColor(defRd.correction)+'">'+fmtC(defRd.correction)+'</div>':'')
+        +'</div></td>'
+      :'<td class="default-col" style="text-align:center"><span style="color:#1e2e42">--</span></td>';
     var cells = MANUAL_RUNS.map(function(run){
       var rd = (r.runs||{})[run]||{};
       var has = rd.mae||rd.correction;
@@ -1133,18 +1282,21 @@ function render(data){
           (rd.correction!=null&&rd.correction!==""?'<div style="color:'+corrColor(rd.correction)+'">'+fmtC(rd.correction)+'</div>':'')+'</div>'
         :'<span style="color:#1e2e42">--</span>')+'</td>';
     }).join("");
-    return '<tr style="'+bg+'"><td style="color:#e8f0f8;font-weight:600">'+r.model+'</td>'+cells+'</tr>';
+    return '<tr style="'+bg+'"><td style="color:#e8f0f8;font-weight:600">'+r.model+'</td>'+defCell+cells+'</tr>';
   }).join("");
 
   document.getElementById("run-cards").innerHTML = rows.map(function(r){
     var runKey = r.run ? r.run.replace(/[^0-9]/g,"").slice(0,2)+"Z" : "";
     var rd = (r.runs||{})[runKey]||{};
     var hasC = rd.correction!=null&&rd.correction!=="";
-    return '<div style="background:#0b1520;border:1px solid var(--border);border-radius:5px;padding:8px 12px;min-width:120px">'
+    var usingDefault = !hasC && (r.runs||{})["default"] && ((r.runs||{})["default"].correction!=null&&(r.runs||{})["default"].correction!=="");
+    var defRd = (r.runs||{})["default"]||{};
+    return '<div style="background:#0b1520;border:1px solid '+(usingDefault?"var(--orange)":"var(--border)")+';border-radius:5px;padding:8px 12px;min-width:120px">'
       +'<div style="font-size:11px;color:#8aabcc;font-weight:600">'+r.model+'</div>'
       +'<div style="font-size:13px;color:var(--blue);margin-top:2px">'+(r.run||"--")+'</div>'
-      +(hasC?'<div style="font-size:11px;color:'+corrColor(rd.correction)+';margin-top:2px">Corr: '+fmtC(rd.correction)+'</div>'
-             :'<div style="font-size:10px;color:#2a4060;margin-top:2px">No run corr</div>')
+      +(hasC?'<div style="font-size:11px;color:'+corrColor(rd.correction)+';margin-top:2px">Corr: '+fmtC(rd.correction)+' <span style="font-size:9px;color:#38bdf8">R</span></div>'
+        :usingDefault?'<div style="font-size:11px;color:var(--orange);margin-top:2px">Default: '+fmtC(defRd.correction)+' <span style="font-size:9px">D</span></div>'
+        :'<div style="font-size:10px;color:#2a4060;margin-top:2px">No run corr</div>')
       +'</div>';
   }).join("");
 
@@ -1234,11 +1386,10 @@ function startCountdown(){
   },1000);
 }
 
-// Set initial page title/subtitle
 document.getElementById("page-title").textContent = STATION + " \u00b7 Model Tracker";
 document.getElementById("page-sub").textContent = STATION_NAMES[STATION] || STATION;
 
-buildForms(); renderPreview(); poll(); startCountdown(); setInterval(poll,300000);
+buildForms(); buildDefaultForm(); renderPreview(); poll(); startCountdown(); setInterval(poll,300000);
 
 document.addEventListener("visibilitychange", function(){
   if(document.visibilityState === "visible"){ poll(); }
@@ -1334,11 +1485,18 @@ document.querySelectorAll("nav button").forEach(function(btn){
 _started = False
 _start_lock = threading.Lock()
 
+def load_accuracy(station):
+    data = load_json_file(f"{DATA_DIR}/accuracy_{station}.json", {})
+    if data:
+        get_state(station)["accuracy"] = data
+
 def start_background():
     global _started
     with _start_lock:
         if not _started:
             _started = True
+            for station in STATIONS:
+                load_accuracy(station)
             t = threading.Thread(target=background_loop, daemon=True)
             t.start()
             print("Background loop started")
