@@ -120,7 +120,20 @@ def station_day_bounds(station="KOKC", offset=0):
 
 def today_entries(temps, station="KOKC"):
     day_start, day_end = station_day_bounds(station, 0)
-    filtered = [x for x in temps if parse_vt(x) is not None and day_start <= parse_vt(x) < day_end]
+
+    filtered = [
+        x for x in temps
+        if parse_vt(x) is not None
+        and day_start <= parse_vt(x) < day_end
+    ]
+
+    add_log(
+        f"today_entries: {station} total={len(temps)} filtered={len(filtered)} "
+        f"window={day_start} -> {day_end}",
+        "info",
+        station
+    )
+
     return filtered if filtered else temps
 
 def tomorrow_entries(temps, station="KOKC"):
@@ -164,9 +177,15 @@ def fetch_all(station="KOKC"):
 
     # Observation
     try:
-        obs = wethr_get(f"observations.php?station_code={station}&mode=latest")
-        st["obs"] = obs
-        add_log(f"Obs: {obs.get('temperature_display')}F", "ok", station)
+    obs = wethr_get(f"observations.php?station_code={station}&mode=latest")
+    st["obs"] = obs
+
+    add_log(
+        f"Obs: {obs.get('temperature_display')}F "
+        f"time={obs.get('observation_time')}",
+        "ok",
+        station
+    )
     except Exception as e:
         errors.append(f"Obs: {e}")
         add_log(f"Obs error: {e}", "err", station)
