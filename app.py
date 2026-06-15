@@ -203,8 +203,9 @@ def fetch_all(station="KOKC"):
     if not fetch_targets:
         add_log("No accuracy data yet — using all known models", "warn", station)
         fetch_targets = ALL_KNOWN_MODELS
-        utc_now = datetime.utcnow()
-        tz_offset = STATION_TZ_OFFSET.get(station, -6)
+
+    utc_now = datetime.utcnow()
+    tz_offset = STATION_TZ_OFFSET.get(station, -6)
 
     for model in fetch_targets:
         try:
@@ -244,9 +245,10 @@ def fetch_all(station="KOKC"):
                 }
                 add_log(f"{model}: high={raw_temp} now={current_temp} run={run_fmt} ({len(todays)} entries)", "ok", station)
         except Exception as e:
-    errors.append(f"{model}: {e}")
-    add_log(f"{model} error: {str(e)}", "warn", station)
-    print(f"FULL ERROR for {model}: {e}", flush=True)
+            errors.append(f"{model}: {e}")
+            add_log(f"{model} error: {str(e)}", "warn", station)
+            print(f"FULL ERROR for {model}: {e}", flush=True)
+
     st["nws_versions"] = {}
     st["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     st["errors"] = errors
