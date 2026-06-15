@@ -208,7 +208,7 @@ def fetch_all(station="KOKC"):
 
     for model in fetch_targets:
         try:
-            data = wethr_get(f"forecasts.php?location_name={station}&model={requests.utils.quote(model)}&run=latest")
+            data = wethr_get(f"forecasts.php?location_code={station}&model={requests.utils.quote(model)}&run=latest")
             temps = data if isinstance(data, list) else data.get("forecasts", [])
             meta = {} if isinstance(data, list) else data
             if temps:
