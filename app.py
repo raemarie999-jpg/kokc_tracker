@@ -1,7 +1,9 @@
-import os, json, time, threading
+import os, json, time, threading, random
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, render_template_string
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024  # 2MB limit
@@ -10,6 +12,11 @@ API_KEY = os.environ.get("WETHR_API_KEY", "")
 DATA_DIR = "/data"
 PACING_FILE = f"{DATA_DIR}/pacing_snapshots.json"
 HISTORY_FILE = f"{DATA_DIR}/daily_history.json"
+
+# --- Rate limiting: max requests per second to wethr API ---
+_api_lock = threading.Lock()
+_last_request_time = 0
+MIN_REQUEST_INTERVAL = 1.5  # seconds between API calls
 
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -84,14 +91,48 @@ def add_log(msg, level="info", station="KOKC"):
     st["log"] = st["log"][:100]
     print(f"[{station}][{entry['t']}] {msg}")
 
-def wethr_get(path):
-    r = requests.get(
-        f"https://wethr.net/api/v2/{path}",
-        headers={"X-API-Key": API_KEY},
-        timeout=6
-    )
-    r.raise_for_status()
-    return r.json()
+def _throttle():
+    """Enforce minimum interval between API calls (global, across all stations)."""
+    global _last_request_time
+    with _api_lock:
+        now = time.monotonic()
+        gap = now - _last_request_time
+        if gap < MIN_REQUEST_INTERVAL:
+            time.sleep(MIN_REQUEST_INTERVAL - gap)
+        _last_request_time = time.monotonic()
+
+def wethr_get(path, retries=3):
+    """
+    Rate-limited GET with exponential backoff retry on 429/5xx.
+    """
+    for attempt in range(retries):
+        _throttle()
+        try:
+            r = requests.get(
+                f"https://wethr.net/api/v2/{path}",
+                headers={"X-API-Key": API_KEY},
+                timeout=10
+            )
+            if r.status_code == 429:
+                wait = (2 ** attempt) * 5 + random.uniform(1, 3)
+                print(f"[429] Rate limited on {path}. Waiting {wait:.1f}s (attempt {attempt+1}/{retries})")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.HTTPError as e:
+            if attempt < retries - 1 and e.response is not None and e.response.status_code in (429, 500, 502, 503):
+                wait = (2 ** attempt) * 5 + random.uniform(1, 3)
+                print(f"[{e.response.status_code}] Retrying {path} in {wait:.1f}s")
+                time.sleep(wait)
+                continue
+            raise
+        except requests.exceptions.RequestException:
+            if attempt < retries - 1:
+                time.sleep(3 * (attempt + 1))
+                continue
+            raise
+    raise RuntimeError(f"Failed after {retries} attempts: {path}")
 
 def get_temp(x):
     for k in ["temperature_f","temperature_display","temperature","temp","value","high"]:
@@ -179,7 +220,6 @@ def fetch_all(station="KOKC"):
     try:
         obs = wethr_get(f"observations.php?station_code={station}&mode=latest")
         st["obs"] = obs
-
         add_log(
             f"Obs: {obs.get('temperature_display')}F "
             f"time={obs.get('observation_time')}",
@@ -207,6 +247,7 @@ def fetch_all(station="KOKC"):
     utc_now = datetime.utcnow()
     tz_offset = STATION_TZ_OFFSET.get(station, -6)
 
+    # Sequential model fetches with throttling (handled inside wethr_get)
     for model in fetch_targets:
         try:
             data = wethr_get(f"forecasts.php?location_code={station}&model={requests.utils.quote(model)}&run=latest")
@@ -351,15 +392,19 @@ def build_snapshot_rows(station="KOKC"):
     return rows
 
 def scheduled_fetch():
+    """
+    Fetch each station sequentially with a generous gap between them.
+    Each station's model fetches are already serialized + throttled inside fetch_all.
+    """
     for i, station in enumerate(STATIONS):
         if i > 0:
-            time.sleep(30)
+            # Wait long enough for the previous station's fetches to finish
+            # and for the API to not consider it a burst.
+            gap = 90 + random.uniform(5, 15)
+            add_log(f"Waiting {gap:.0f}s before fetching next station", "info", STATIONS[i-1])
+            time.sleep(gap)
         try:
-            t = threading.Thread(target=fetch_all, args=(station,), daemon=True)
-            t.start()
-            t.join(timeout=120)
-            if t.is_alive():
-                add_log("Fetch timed out", "err", station)
+            fetch_all(station)
         except Exception as e:
             add_log(f"scheduled_fetch error: {e}", "err", station)
 
@@ -437,6 +482,8 @@ def save_consensus_snapshot(station="KOKC"):
         add_log(f"Consensus snapshot error: {e}", "warn", station)
 
 def background_loop():
+    # Stagger the very first fetch slightly so the app finishes starting up
+    time.sleep(random.uniform(3, 8))
     while True:
         try:
             scheduled_fetch()
@@ -802,7 +849,7 @@ th.default-col{color:var(--orange) !important}
     <div class="ctitle" style="color:var(--orange)">&#9888; Default / Fallback Run Values</div>
     <p style="color:var(--dim);font-size:12px;line-height:1.7;margin-bottom:12px">
       Set a fallback MAE &amp; Correction per model. These apply automatically whenever a model's active run
-      has <em>no</em> run-specific entry — keeping it out of consensus rather than polluting it with uncalibrated data.
+      has <em>no</em> run-specific entry &mdash; keeping it out of consensus rather than polluting it with uncalibrated data.
       <br><span style="color:var(--orange)">D</span> badge in the dashboard Correction column indicates the default is active.
     </p>
     <div style="overflow-x:auto">
