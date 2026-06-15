@@ -177,8 +177,8 @@ def fetch_all(station="KOKC"):
 
     # Observation
     try:
-    obs = wethr_get(f"observations.php?station_code={station}&mode=latest")
-    st["obs"] = obs
+        obs = wethr_get(f"observations.php?station_code={station}&mode=latest")
+        st["obs"] = obs
 
     add_log(
         f"Obs: {obs.get('temperature_display')}F "
