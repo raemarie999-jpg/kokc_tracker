@@ -135,11 +135,25 @@ def wethr_get(path, retries=3):
     raise RuntimeError(f"Failed after {retries} attempts: {path}")
 
 def get_temp(x):
-    for k in ["temperature_f","temperature_display","temperature","temp","value","high"]:
+    # Exhaustive key list covering known wethr API variants
+    for k in ["temperature_f","temperature_display","temperature","temp","value","high",
+              "max_temp","max_temperature","temp_f","temp_max","forecast_high",
+              "temperature_high","t","fahrenheit","f"]:
         v = x.get(k)
         if v is not None:
             try: return round(float(v), 1)
             except: pass
+    # Last resort: find any numeric-looking value in the dict that's plausibly a temp
+    for k, v in x.items():
+        if k in ("valid_time","run_time","run","model","station","date","time","hour","id","type"):
+            continue
+        if v is not None and not isinstance(v, (dict, list)):
+            try:
+                f = float(v)
+                if 0 < f < 130:  # plausible Fahrenheit range
+                    return round(f, 1)
+            except:
+                pass
     return None
 
 def parse_vt(x):
@@ -254,6 +268,10 @@ def fetch_all(station="KOKC"):
             temps = data if isinstance(data, list) else data.get("forecasts", [])
             meta = {} if isinstance(data, list) else data
             if temps:
+                # Log the raw keys of the first entry so we can see the API shape
+                if temps:
+                    sample = temps[0]
+                    add_log(f"{model} sample keys: {list(sample.keys())} | vals: {dict(list(sample.items())[:6])}", "info", station)
                 todays = today_entries(temps, station)
                 if not todays:
                     add_log(f"{model}: no entries for today", "warn", station)
@@ -284,7 +302,10 @@ def fetch_all(station="KOKC"):
                     "tmr_low": tmr_low,
                     "tmr_low_time": tmr_low_time,
                 }
-                add_log(f"{model}: high={raw_temp} now={current_temp} run={run_fmt} ({len(todays)} entries)", "ok", station)
+                if raw_temp is None:
+                    add_log(f"{model}: WARNING raw_temp=None — check sample keys above. entry keys={list(max_entry.keys())}", "warn", station)
+                else:
+                    add_log(f"{model}: high={raw_temp} now={current_temp} run={run_fmt} ({len(todays)} entries)", "ok", station)
         except Exception as e:
             errors.append(f"{model}: {e}")
             add_log(f"{model} error: {str(e)}", "warn", station)
@@ -624,7 +645,31 @@ def api_consensus_snapshots():
         "station": station,
     })
 
-@app.route("/api/refresh", methods=["POST"])
+@app.route("/api/debug")
+def api_debug():
+    """Fetch one model raw and return the unprocessed API response for inspection."""
+    station = request.args.get("station", "KOKC").upper()
+    model = request.args.get("model", "HRRR")
+    if station not in STATIONS:
+        station = "KOKC"
+    if not API_KEY:
+        return jsonify({"error": "No API key set"})
+    try:
+        data = wethr_get(f"forecasts.php?location_code={station}&model={requests.utils.quote(model)}&run=latest")
+        temps = data if isinstance(data, list) else data.get("forecasts", [])
+        sample = temps[:3] if temps else []
+        return jsonify({
+            "model": model,
+            "station": station,
+            "response_type": type(data).__name__,
+            "top_level_keys": list(data.keys()) if isinstance(data, dict) else "list",
+            "total_entries": len(temps),
+            "sample_entries": sample,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
 def manual_refresh():
     station = request.args.get("station", "KOKC").upper()
     if station not in STATIONS:
