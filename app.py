@@ -180,12 +180,12 @@ def fetch_all(station="KOKC"):
         obs = wethr_get(f"observations.php?station_code={station}&mode=latest")
         st["obs"] = obs
 
-    add_log(
-        f"Obs: {obs.get('temperature_display')}F "
-        f"time={obs.get('observation_time')}",
-        "ok",
-        station
-    )
+        add_log(
+            f"Obs: {obs.get('temperature_display')}F "
+            f"time={obs.get('observation_time')}",
+            "ok",
+            station
+        )
     except Exception as e:
         errors.append(f"Obs: {e}")
         add_log(f"Obs error: {e}", "err", station)
