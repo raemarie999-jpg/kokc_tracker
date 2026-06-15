@@ -694,6 +694,14 @@ def manual_refresh():
         station = "KOKC"
     threading.Thread(target=fetch_all, args=(station,), daemon=True).start()
     return jsonify({"ok": True})
+@app.before_request
+def watchdog():
+    for t in threading.enumerate():
+        if t.name == "bgloop":
+            return
+    print("WATCHDOG: restarting background thread", flush=True)
+    t = threading.Thread(target=background_loop, daemon=True, name="bgloop")
+    t.start()
 
 @app.route("/")
 def index():
