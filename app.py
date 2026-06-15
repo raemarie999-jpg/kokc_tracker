@@ -264,7 +264,7 @@ def fetch_all(station="KOKC"):
     # Sequential model fetches with throttling (handled inside wethr_get)
     for model in fetch_targets:
         try:
-            data = wethr_get(f"forecasts.php?location_code={station}&model={requests.utils.quote(model)}&run=latest")
+            data = wethr_get(f"forecasts.php?station_code={station}&model={requests.utils.quote(model)}&run=latest")
             temps = data if isinstance(data, list) else data.get("forecasts", [])
             meta = {} if isinstance(data, list) else data
             if temps:
@@ -654,20 +654,31 @@ def api_debug():
         station = "KOKC"
     if not API_KEY:
         return jsonify({"error": "No API key set"})
-    try:
-        data = wethr_get(f"forecasts.php?location_code={station}&model={requests.utils.quote(model)}&run=latest")
-        temps = data if isinstance(data, list) else data.get("forecasts", [])
-        sample = temps[:3] if temps else []
-        return jsonify({
-            "model": model,
-            "station": station,
-            "response_type": type(data).__name__,
-            "top_level_keys": list(data.keys()) if isinstance(data, dict) else "list",
-            "total_entries": len(temps),
-            "sample_entries": sample,
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)})
+    results = {}
+    # Try every plausible parameter name combination
+    attempts = [
+        f"forecasts.php?station_code={station}&model={requests.utils.quote(model)}&run=latest",
+        f"forecasts.php?location_code={station}&model={requests.utils.quote(model)}&run=latest",
+        f"forecasts.php?station={station}&model={requests.utils.quote(model)}&run=latest",
+        f"forecasts.php?station_code={station}&model={requests.utils.quote(model)}",
+        f"forecasts.php?station_code={station}&model={requests.utils.quote(model)}&run=0",
+    ]
+    for url in attempts:
+        try:
+            data = wethr_get(url)
+            temps = data if isinstance(data, list) else data.get("forecasts", [])
+            sample = temps[:2] if temps else []
+            results[url] = {
+                "status": "OK",
+                "response_type": type(data).__name__,
+                "top_level_keys": list(data.keys()) if isinstance(data, dict) else "list",
+                "total_entries": len(temps),
+                "sample_entries": sample,
+            }
+            break  # stop at first success
+        except Exception as e:
+            results[url] = {"status": "ERROR", "error": str(e)}
+    return jsonify(results)
 
 
 def manual_refresh():
