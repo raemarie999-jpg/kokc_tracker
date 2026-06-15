@@ -503,12 +503,10 @@ def save_consensus_snapshot(station="KOKC"):
         add_log(f"Consensus snapshot error: {e}", "warn", station)
 
 def background_loop():
-    # Stagger the very first fetch slightly so the app finishes starting up
-        print("BACKGROUND THREAD STARTING", flush=True)
+    print("BACKGROUND THREAD STARTING", flush=True)
     time.sleep(random.uniform(3, 8))
     while True:
         print("BACKGROUND LOOP RUNNING", flush=True)
-
         try:
             scheduled_fetch()
         except Exception as e:
