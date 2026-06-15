@@ -244,9 +244,9 @@ def fetch_all(station="KOKC"):
                 }
                 add_log(f"{model}: high={raw_temp} now={current_temp} run={run_fmt} ({len(todays)} entries)", "ok", station)
         except Exception as e:
-            errors.append(f"{model}: {e}")
-            add_log(f"{model} error: {str(e)[:80]}", "warn", station)
-
+    errors.append(f"{model}: {e}")
+    add_log(f"{model} error: {str(e)}", "warn", station)
+    print(f"FULL ERROR for {model}: {e}", flush=True)
     st["nws_versions"] = {}
     st["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     st["errors"] = errors
