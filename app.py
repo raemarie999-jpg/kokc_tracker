@@ -644,6 +644,13 @@ def api_consensus_snapshots():
         "history": disk,
         "station": station,
     })
+@app.route("/api/debug_threads")
+def debug_threads():
+    return jsonify({
+        "started_flag": _started,
+        "threads": [t.name for t in threading.enumerate()],
+        "pid": os.getpid(),
+    })
 
 @app.route("/api/debug")
 def api_debug():
