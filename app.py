@@ -200,9 +200,9 @@ def fetch_all(station="KOKC"):
         add_log(f"Wethr High error: {e}", "err", station)
 
     fetch_targets = active_models(station)
-    if not fetch_targets:
-        add_log("No accuracy data yet — skipping model fetch", "warn", station)
-        return
+if not fetch_targets:
+    add_log("No accuracy data yet — using all known models", "warn", station)
+    fetch_targets = ALL_KNOWN_MODELS
     utc_now = datetime.utcnow()
     tz_offset = STATION_TZ_OFFSET.get(station, -6)
 
