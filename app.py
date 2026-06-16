@@ -16,7 +16,7 @@ HISTORY_FILE = f"{DATA_DIR}/daily_history.json"
 # --- Rate limiting: max requests per second to wethr API ---
 _api_lock = threading.Lock()
 _last_request_time = 0
-MIN_REQUEST_INTERVAL = 1.5  # seconds between API calls
+MIN_REQUEST_INTERVAL = 60  # seconds between API calls
 
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
