@@ -16,7 +16,7 @@ HISTORY_FILE = f"{DATA_DIR}/daily_history.json"
 # --- Rate limiting: max requests per second to wethr API ---
 _api_lock = threading.Lock()
 _last_request_time = 0
-MIN_REQUEST_INTERVAL = 1.5  # seconds between API calls
+MIN_REQUEST_INTERVAL = 5.0  # seconds between API calls — increased to avoid 429s
 
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -58,7 +58,7 @@ ALL_KNOWN_MODELS = [
 ]
 RUN_CYCLES = ["00Z","01Z","02Z","03Z","04Z","05Z","06Z","07Z","08Z","09Z","10Z","11Z",
               "12Z","13Z","14Z","15Z","16Z","17Z","18Z","19Z","20Z","21Z","22Z","23Z"]
-REFRESH_SEC = 600
+REFRESH_SEC = 900  # 15 minutes between full fetch cycles — reduced to stay under rate limits
 
 def make_state():
     return {
@@ -114,7 +114,7 @@ def wethr_get(path, retries=3):
                 timeout=10
             )
             if r.status_code == 429:
-                wait = (2 ** attempt) * 5 + random.uniform(1, 3)
+                wait = (2 ** attempt) * 20 + random.uniform(5, 15)
                 print(f"[429] Rate limited on {path}. Waiting {wait:.1f}s (attempt {attempt+1}/{retries})")
                 time.sleep(wait)
                 continue
@@ -122,7 +122,7 @@ def wethr_get(path, retries=3):
             return r.json()
         except requests.exceptions.HTTPError as e:
             if attempt < retries - 1 and e.response is not None and e.response.status_code in (429, 500, 502, 503):
-                wait = (2 ** attempt) * 5 + random.uniform(1, 3)
+                wait = (2 ** attempt) * 20 + random.uniform(5, 15)
                 print(f"[{e.response.status_code}] Retrying {path} in {wait:.1f}s")
                 time.sleep(wait)
                 continue
@@ -421,7 +421,7 @@ def scheduled_fetch():
         if i > 0:
             # Wait long enough for the previous station's fetches to finish
             # and for the API to not consider it a burst.
-            gap = 90 + random.uniform(5, 15)
+            gap = 240 + random.uniform(10, 30)
             add_log(f"Waiting {gap:.0f}s before fetching next station", "info", STATIONS[i-1])
             time.sleep(gap)
         try:
