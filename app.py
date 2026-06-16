@@ -1637,7 +1637,7 @@ def start_background():
             _started = True
             for station in STATIONS:
                 load_accuracy(station)
-            t = threading.Thread(target=background_loop, daemon=True)
+            t = threading.Thread(target=background_loop, daemon=True, name="bgloop")
             t.start()
             print("Background loop started")
 
