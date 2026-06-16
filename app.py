@@ -264,7 +264,7 @@ def fetch_all(station="KOKC"):
     # Sequential model fetches with throttling (handled inside wethr_get)
     for model in fetch_targets:
         try:
-            data = wethr_get(f"forecasts.php?location_name={station}&model={requests.utils.quote(model)}&run=latest")
+            data = wethr_get(f"forecasts.php?station_code={station}&model={requests.utils.quote(model)}&run=latest")
             temps = data if isinstance(data, list) else data.get("forecasts", [])
             meta = {} if isinstance(data, list) else data
             if temps:
