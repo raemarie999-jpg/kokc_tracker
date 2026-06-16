@@ -1624,6 +1624,7 @@ document.querySelectorAll("nav button").forEach(function(btn){
 
 _started = False
 _start_lock = threading.Lock()
+_bg_thread = None
 
 def load_accuracy(station):
     data = load_json_file(f"{DATA_DIR}/accuracy_{station}.json", {})
@@ -1631,14 +1632,14 @@ def load_accuracy(station):
         get_state(station)["accuracy"] = data
 
 def start_background():
-    global _started
+    global _started, _bg_thread
     with _start_lock:
         if not _started:
             _started = True
             for station in STATIONS:
                 load_accuracy(station)
-            t = threading.Thread(target=background_loop, daemon=True)
-            t.start()
+            _bg_thread = threading.Thread(target=background_loop, daemon=True, name="bgloop")
+            _bg_thread.start()
             print("Background loop started")
 
 with app.app_context():
