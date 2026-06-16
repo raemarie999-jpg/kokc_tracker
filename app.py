@@ -264,7 +264,7 @@ def fetch_all(station="KOKC"):
     # Sequential model fetches with throttling (handled inside wethr_get)
     for model in fetch_targets:
         try:
-            data = wethr_get(f"forecasts.php?station_code={station}&model={requests.utils.quote(model)}&run=latest")
+            data = wethr_get(f"forecasts.php?location_name={station}&model={requests.utils.quote(model)}&run=latest")
             temps = data if isinstance(data, list) else data.get("forecasts", [])
             meta = {} if isinstance(data, list) else data
             if temps:
@@ -688,7 +688,6 @@ def api_debug():
             results[url] = {"status": "ERROR", "error": str(e)}
     return jsonify(results)
 
-@app.route("/api/refresh", methods=["POST"])
 
 def manual_refresh():
     station = request.args.get("station", "KOKC").upper()
@@ -698,12 +697,12 @@ def manual_refresh():
     return jsonify({"ok": True})
 @app.before_request
 def watchdog():
-    global _bg_thread
-    if _bg_thread is not None and _bg_thread.is_alive():
-        return
+    for t in threading.enumerate():
+        if t.name == "bgloop":
+            return
     print("WATCHDOG: restarting background thread", flush=True)
-    _bg_thread = threading.Thread(target=background_loop, daemon=True, name="bgloop")
-    _bg_thread.start()
+    t = threading.Thread(target=background_loop, daemon=True, name="bgloop")
+    t.start()
 
 @app.route("/")
 def index():
@@ -1625,7 +1624,6 @@ document.querySelectorAll("nav button").forEach(function(btn){
 
 _started = False
 _start_lock = threading.Lock()
-_bg_thread = None
 
 def load_accuracy(station):
     data = load_json_file(f"{DATA_DIR}/accuracy_{station}.json", {})
@@ -1633,14 +1631,14 @@ def load_accuracy(station):
         get_state(station)["accuracy"] = data
 
 def start_background():
-    global _started, _bg_thread
+    global _started
     with _start_lock:
         if not _started:
             _started = True
             for station in STATIONS:
                 load_accuracy(station)
-            _bg_thread = threading.Thread(target=background_loop, daemon=True, name="bgloop")
-            _bg_thread.start()
+            t = threading.Thread(target=background_loop, daemon=True)
+            t.start()
             print("Background loop started")
 
 with app.app_context():
