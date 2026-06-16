@@ -697,12 +697,12 @@ def manual_refresh():
     return jsonify({"ok": True})
 @app.before_request
 def watchdog():
-    for t in threading.enumerate():
-        if t.name == "bgloop":
-            return
+    global _bg_thread
+    if _bg_thread is not None and _bg_thread.is_alive():
+        return
     print("WATCHDOG: restarting background thread", flush=True)
-    t = threading.Thread(target=background_loop, daemon=True, name="bgloop")
-    t.start()
+    _bg_thread = threading.Thread(target=background_loop, daemon=True, name="bgloop")
+    _bg_thread.start()
 
 @app.route("/")
 def index():
