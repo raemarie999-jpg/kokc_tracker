@@ -16,7 +16,7 @@ HISTORY_FILE = f"{DATA_DIR}/daily_history.json"
 # --- Rate limiting: max requests per second to wethr API ---
 _api_lock = threading.Lock()
 _last_request_time = 0
-MIN_REQUEST_INTERVAL = 15.0  # seconds between API calls — increased to avoid 429s
+MIN_REQUEST_INTERVAL = 1.5  # seconds between API calls
 
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -58,7 +58,7 @@ ALL_KNOWN_MODELS = [
 ]
 RUN_CYCLES = ["00Z","01Z","02Z","03Z","04Z","05Z","06Z","07Z","08Z","09Z","10Z","11Z",
               "12Z","13Z","14Z","15Z","16Z","17Z","18Z","19Z","20Z","21Z","22Z","23Z"]
-REFRESH_SEC = 900  # 15 minutes between full fetch cycles — reduced to stay under rate limits
+REFRESH_SEC = 600
 
 def make_state():
     return {
@@ -102,7 +102,6 @@ def _throttle():
         _last_request_time = time.monotonic()
 
 def wethr_get(path, retries=3):
-    print(f"DEBUG: Using API Key: {'NOT SET' if not API_KEY else 'LOADED (' + API_KEY[:4] + '...)'}")
     """
     Rate-limited GET with exponential backoff retry on 429/5xx.
     """
@@ -115,7 +114,7 @@ def wethr_get(path, retries=3):
                 timeout=10
             )
             if r.status_code == 429:
-                wait = (2 ** attempt) * 20 + random.uniform(5, 15)
+                wait = (2 ** attempt) * 5 + random.uniform(1, 3)
                 print(f"[429] Rate limited on {path}. Waiting {wait:.1f}s (attempt {attempt+1}/{retries})")
                 time.sleep(wait)
                 continue
@@ -123,7 +122,7 @@ def wethr_get(path, retries=3):
             return r.json()
         except requests.exceptions.HTTPError as e:
             if attempt < retries - 1 and e.response is not None and e.response.status_code in (429, 500, 502, 503):
-                wait = (2 ** attempt) * 20 + random.uniform(5, 15)
+                wait = (2 ** attempt) * 5 + random.uniform(1, 3)
                 print(f"[{e.response.status_code}] Retrying {path} in {wait:.1f}s")
                 time.sleep(wait)
                 continue
@@ -332,7 +331,6 @@ def fetch_all(station="KOKC"):
 
 
 _memory_snapshots = {}
-_started = False
 
 def save_pacing_snapshot(rows, station="KOKC"):
     st = get_state(station)
@@ -423,7 +421,7 @@ def scheduled_fetch():
         if i > 0:
             # Wait long enough for the previous station's fetches to finish
             # and for the API to not consider it a burst.
-            gap = 240 + random.uniform(10, 30)
+            gap = 90 + random.uniform(5, 15)
             add_log(f"Waiting {gap:.0f}s before fetching next station", "info", STATIONS[i-1])
             time.sleep(gap)
         try:
@@ -505,10 +503,12 @@ def save_consensus_snapshot(station="KOKC"):
         add_log(f"Consensus snapshot error: {e}", "warn", station)
 
 def background_loop():
-    print("BACKGROUND THREAD STARTING", flush=True)
+    # Stagger the very first fetch slightly so the app finishes starting up
+        print("BACKGROUND THREAD STARTING", flush=True)
     time.sleep(random.uniform(3, 8))
     while True:
         print("BACKGROUND LOOP RUNNING", flush=True)
+
         try:
             scheduled_fetch()
         except Exception as e:
@@ -526,27 +526,6 @@ def _get_prev_days(n, station="KOKC"):
     history = load_json_file(f"{DATA_DIR}/history_{station}.json", {})
     keys = sorted(history.keys(), reverse=True)[:n]
     return [{"date": k, "avg_pace": history[k]["avg_pace"], "snapshot_count": history[k].get("snapshot_count",0)} for k in keys]
-
-@app.route("/api/refresh", methods=["POST"])
-def route_manual_refresh():
-    station = request.args.get("station", "KOKC").upper()
-    if station not in STATIONS:
-        station = "KOKC"
-    threading.Thread(target=fetch_all, args=(station,), daemon=True).start()
-    return jsonify({"ok": True})
-
-@app.route("/api/test-connect")
-def test_connect():
-    try:
-        r = requests.get(
-            f"https://wethr.net/api/v2/observations.php?station_code=KOKC&mode=latest",
-            headers={"X-API-Key": API_KEY},
-            timeout=10
-        )
-        return jsonify({"status": r.status_code, "text": r.text})
-    except Exception as e:
-        return jsonify({"error": str(e)})
-
 
 @app.route("/api/state")
 def api_state():
@@ -718,20 +697,14 @@ def manual_refresh():
         station = "KOKC"
     threading.Thread(target=fetch_all, args=(station,), daemon=True).start()
     return jsonify({"ok": True})
-
 @app.before_request
 def watchdog():
-    global _started
-    # Check if thread is running
-    is_running = any(t.name == "bgloop" for t in threading.enumerate())
-    if not is_running:
-        print("WATCHDOG: Starting background thread...", flush=True)
-        # Load accuracy before starting
-        for station in STATIONS:
-            load_accuracy(station)
-        t = threading.Thread(target=background_loop, daemon=True, name="bgloop")
-        t.start()
-        _started = True
+    for t in threading.enumerate():
+        if t.name == "bgloop":
+            return
+    print("WATCHDOG: restarting background thread", flush=True)
+    t = threading.Thread(target=background_loop, daemon=True, name="bgloop")
+    t.start()
 
 @app.route("/")
 def index():
@@ -1669,6 +1642,9 @@ def start_background():
             t = threading.Thread(target=background_loop, daemon=True)
             t.start()
             print("Background loop started")
+
+with app.app_context():
+    start_background()
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
