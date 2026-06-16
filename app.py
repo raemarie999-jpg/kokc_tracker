@@ -102,6 +102,7 @@ def _throttle():
         _last_request_time = time.monotonic()
 
 def wethr_get(path, retries=3):
+    print(f"DEBUG: Using API Key: {'NOT SET' if not API_KEY else 'LOADED (' + API_KEY[:4] + '...)'}")
     """
     Rate-limited GET with exponential backoff retry on 429/5xx.
     """
