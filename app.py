@@ -527,7 +527,6 @@ def _get_prev_days(n, station="KOKC"):
     keys = sorted(history.keys(), reverse=True)[:n]
     return [{"date": k, "avg_pace": history[k]["avg_pace"], "snapshot_count": history[k].get("snapshot_count",0)} for k in keys]
 
-# --- ADD THIS BLOCK HERE ---
 @app.route("/api/refresh", methods=["POST"])
 def route_manual_refresh():
     station = request.args.get("station", "KOKC").upper()
@@ -535,7 +534,19 @@ def route_manual_refresh():
         station = "KOKC"
     threading.Thread(target=fetch_all, args=(station,), daemon=True).start()
     return jsonify({"ok": True})
-# ---------------------------
+
+@app.route("/api/test-connect")
+def test_connect():
+    try:
+        r = requests.get(
+            f"https://wethr.net/api/v2/observations.php?station_code=KOKC&mode=latest",
+            headers={"X-API-Key": API_KEY},
+            timeout=10
+        )
+        return jsonify({"status": r.status_code, "text": r.text})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
 
 @app.route("/api/state")
 def api_state():
