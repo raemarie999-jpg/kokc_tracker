@@ -525,13 +525,6 @@ def _get_prev_days(n, station="KOKC"):
     keys = sorted(history.keys(), reverse=True)[:n]
     return [{"date": k, "avg_pace": history[k]["avg_pace"], "snapshot_count": history[k].get("snapshot_count",0)} for k in keys]
 
-@app.route("/api/state")
-# ... (your existing code above)
-
-@app.route("/api/history")
-def api_history():
-    # ... (existing history code)
-
 # --- ADD THIS BLOCK HERE ---
 @app.route("/api/refresh", methods=["POST"])
 def route_manual_refresh():
