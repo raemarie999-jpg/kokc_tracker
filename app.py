@@ -16,7 +16,7 @@ HISTORY_FILE = f"{DATA_DIR}/daily_history.json"
 # --- Rate limiting: max requests per second to wethr API ---
 _api_lock = threading.Lock()
 _last_request_time = 0
-MIN_REQUEST_INTERVAL = 60  # seconds between API calls
+MIN_REQUEST_INTERVAL = 2.5  # seconds between API calls
 
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
@@ -58,7 +58,7 @@ ALL_KNOWN_MODELS = [
 ]
 RUN_CYCLES = ["00Z","01Z","02Z","03Z","04Z","05Z","06Z","07Z","08Z","09Z","10Z","11Z",
               "12Z","13Z","14Z","15Z","16Z","17Z","18Z","19Z","20Z","21Z","22Z","23Z"]
-REFRESH_SEC = 600
+REFRESH_SEC = 1080
 
 def make_state():
     return {
@@ -421,7 +421,7 @@ def scheduled_fetch():
         if i > 0:
             # Wait long enough for the previous station's fetches to finish
             # and for the API to not consider it a burst.
-            gap = 90 + random.uniform(5, 15)
+            gap = 10 + random.uniform(2, 5)
             add_log(f"Waiting {gap:.0f}s before fetching next station", "info", STATIONS[i-1])
             time.sleep(gap)
         try:
