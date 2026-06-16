@@ -688,7 +688,6 @@ def api_debug():
             results[url] = {"status": "ERROR", "error": str(e)}
     return jsonify(results)
 
-
 def manual_refresh():
     station = request.args.get("station", "KOKC").upper()
     if station not in STATIONS:
