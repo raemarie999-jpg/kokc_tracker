@@ -331,6 +331,7 @@ def fetch_all(station="KOKC"):
 
 
 _memory_snapshots = {}
+_started = False
 
 def save_pacing_snapshot(rows, station="KOKC"):
     st = get_state(station)
