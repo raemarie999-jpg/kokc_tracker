@@ -526,6 +526,23 @@ def _get_prev_days(n, station="KOKC"):
     return [{"date": k, "avg_pace": history[k]["avg_pace"], "snapshot_count": history[k].get("snapshot_count",0)} for k in keys]
 
 @app.route("/api/state")
+# ... (your existing code above)
+
+@app.route("/api/history")
+def api_history():
+    # ... (existing history code)
+
+# --- ADD THIS BLOCK HERE ---
+@app.route("/api/refresh", methods=["POST"])
+def route_manual_refresh():
+    station = request.args.get("station", "KOKC").upper()
+    if station not in STATIONS:
+        station = "KOKC"
+    threading.Thread(target=fetch_all, args=(station,), daemon=True).start()
+    return jsonify({"ok": True})
+# ---------------------------
+
+@app.route("/api/state")
 def api_state():
     station = request.args.get("station", "KOKC").upper()
     if station not in STATIONS:
