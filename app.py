@@ -18,6 +18,12 @@ _api_lock = threading.Lock()
 _last_request_time = 0
 MIN_REQUEST_INTERVAL = 2.5  # seconds between API calls
 
+# --- Manual refresh cooldown: stops external pings / rapid re-clicks from
+# bypassing REFRESH_SEC and spawning unlimited fetch_all() runs ---
+_manual_refresh_lock = threading.Lock()
+_last_manual_refresh = {}
+MANUAL_REFRESH_COOLDOWN_SEC = 120  # min seconds between manual refreshes, per station
+
 def ensure_data_dir():
     os.makedirs(DATA_DIR, exist_ok=True)
 
@@ -58,7 +64,7 @@ ALL_KNOWN_MODELS = [
 ]
 RUN_CYCLES = ["00Z","01Z","02Z","03Z","04Z","05Z","06Z","07Z","08Z","09Z","10Z","11Z",
               "12Z","13Z","14Z","15Z","16Z","17Z","18Z","19Z","20Z","21Z","22Z","23Z"]
-REFRESH_SEC = 1080
+REFRESH_SEC = 900  # 15 min between auto-refresh cycles; use NOW button for on-demand updates
 
 def make_state():
     return {
@@ -693,6 +699,14 @@ def manual_refresh():
     station = request.args.get("station", "KOKC").upper()
     if station not in STATIONS:
         station = "KOKC"
+    with _manual_refresh_lock:
+        now = time.monotonic()
+        elapsed = now - _last_manual_refresh.get(station, 0)
+        if elapsed < MANUAL_REFRESH_COOLDOWN_SEC:
+            remaining = round(MANUAL_REFRESH_COOLDOWN_SEC - elapsed)
+            add_log(f"Manual refresh ignored (cooldown, {remaining}s left)", "warn", station)
+            return jsonify({"ok": False, "cooldown": True, "remaining_sec": remaining})
+        _last_manual_refresh[station] = now
     threading.Thread(target=fetch_all, args=(station,), daemon=True).start()
     return jsonify({"ok": True})
 @app.before_request
