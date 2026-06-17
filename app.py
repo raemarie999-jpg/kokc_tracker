@@ -64,7 +64,7 @@ ALL_KNOWN_MODELS = [
 ]
 RUN_CYCLES = ["00Z","01Z","02Z","03Z","04Z","05Z","06Z","07Z","08Z","09Z","10Z","11Z",
               "12Z","13Z","14Z","15Z","16Z","17Z","18Z","19Z","20Z","21Z","22Z","23Z"]
-REFRESH_SEC = 900  # 15 min between auto-refresh cycles; use NOW button for on-demand updates
+REFRESH_SEC = 1800  # 30 min between auto-refresh cycles; use NOW button for on-demand updates
 
 def make_state():
     return {
