@@ -782,6 +782,7 @@ def api_debug():
     return jsonify(results)
 
 
+@app.route("/api/refresh", methods=["POST"])
 def manual_refresh():
     station = request.args.get("station", "KOKC").upper()
     if station not in STATIONS:
