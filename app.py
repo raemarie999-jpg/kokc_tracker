@@ -23,8 +23,10 @@ _manual_refresh_lock = threading.Lock()
 _last_manual_refresh = {}
 MANUAL_REFRESH_COOLDOWN_SEC = 120  # min seconds between manual refreshes, per station
 
-# --- Hard daily API cap: resets at 19:30 UTC (= 3:30pm EDT / 2:30pm EST) ---
-DAILY_REQUEST_CAP = 2500
+# --- Daily API call counter: informational only — NO cap is enforced.
+# Resets at 19:30 UTC (= 3:30pm EDT / 2:30pm EST) purely for display purposes
+# in /api/quota, so you can see usage trends without anything ever blocking
+# a fetch. ---
 _CAP_RESET_UTC_HOUR = 19
 _CAP_RESET_UTC_MINUTE = 30
 _counter_lock = threading.Lock()
@@ -37,13 +39,10 @@ _counter_lock = threading.Lock()
 _watchdog_lock = threading.Lock()
 
 
-class DailyCapExceeded(Exception):
-    pass
-
-
 def _get_period_key():
-    """Returns string key for the current quota period.
+    """Returns string key for the current counting period.
     Resets at 19:30 UTC (3:30pm EDT in summer; shifts 1hr in winter — acceptable).
+    Used only to bucket the informational request counter — nothing is gated on it.
     """
     now = datetime.utcnow()
     reset_today = now.replace(hour=_CAP_RESET_UTC_HOUR, minute=_CAP_RESET_UTC_MINUTE, second=0, microsecond=0)
@@ -71,15 +70,14 @@ def _save_api_counter(data):
 
 
 def _check_and_increment():
-    """Raises DailyCapExceeded if at or over cap; otherwise increments and saves.
+    """Increments and saves the informational request counter for the
+    current period. No cap is enforced — this never raises.
     This is the ONE place that should ever increment the counter. Call sites
     must not pre-check/duplicate this logic (see BUG P2)."""
     with _counter_lock:
         period = _get_period_key()
         data = _load_api_counter()
         count = data.get(period, 0)
-        if count >= DAILY_REQUEST_CAP:
-            raise DailyCapExceeded(f"Daily cap ({DAILY_REQUEST_CAP}) reached. Resets at 3:30pm EST.")
         data[period] = count + 1
         keys = sorted(data.keys())
         if len(keys) > 3:
@@ -233,10 +231,11 @@ def _throttle():
 def wethr_get(path, retries=3):
     """
     Rate-limited GET with exponential backoff retry on 429/5xx.
-    Raises DailyCapExceeded immediately if the hard daily cap is reached.
+    No daily cap is enforced — _check_and_increment() only tallies usage for
+    the informational /api/quota endpoint and never blocks a request.
     This is the ONLY place that calls _check_and_increment() — see BUG P2.
     """
-    _check_and_increment()  # raises DailyCapExceeded before any sleep/request
+    _check_and_increment()  # tallies usage only; never raises / never blocks
     for attempt in range(retries):
         _throttle()
         try:
@@ -507,14 +506,15 @@ def fetch_all(station="KOKC"):
 
     # --- BUG P2 FIX ---
     # The previous code had a "preview check" block here that called
-    # _load_api_counter()/_get_period_key() and compared against DAILY_REQUEST_CAP
+    # _load_api_counter()/_get_period_key() and compared against a daily cap
     # *in addition to* the real check inside wethr_get() -> _check_and_increment().
     # That block didn't actually increment anything by itself, but every model
     # fetch below calls wethr_get() multiple times, and the duplicate accounting
-    # logic made it easy to lose track of true quota usage and doubled the
-    # effective cost bookkeeping (108 "slots" worth of checks for 54 real calls
-    # across 18 models x 3 stations). _check_and_increment() inside wethr_get()
-    # is the single source of truth for quota — nothing else should pre-check it.
+    # logic made it easy to lose track of true usage and doubled the effective
+    # cost bookkeeping (108 "slots" worth of checks for 54 real calls across
+    # 18 models x 3 stations). _check_and_increment() inside wethr_get() is the
+    # single source of truth for the (now uncapped, informational-only) usage
+    # counter — nothing else should pre-check or duplicate it.
     add_log("Fetching data...", "info", station)
     errors = []
 
@@ -550,9 +550,6 @@ def fetch_all(station="KOKC"):
                         add_log(f"Solar noon obs: {obs_temp}F ({diff_min:.0f}min from solar noon)", "ok", station)
         except Exception as e:
             add_log(f"Solar noon record error (non-fatal): {e}", "warn", station)
-    except DailyCapExceeded:
-        add_log("Daily cap reached — stopping fetch. Resets 3:30pm EST.", "warn", station)
-        return
     except Exception as e:
         errors.append(f"Obs: {e}")
         add_log(f"Obs error: {e}", "err", station)
@@ -562,9 +559,6 @@ def fetch_all(station="KOKC"):
         wh = wethr_get(f"observations.php?station_code={station}&mode=wethr_high&logic=nws")
         st["wethr_high"] = wh
         add_log(f"Wethr High: {wh.get('wethr_high')}F", "ok", station)
-    except DailyCapExceeded:
-        add_log("Daily cap reached — stopping fetch. Resets 3:30pm EST.", "warn", station)
-        return
     except Exception as e:
         errors.append(f"WethrHigh: {e}")
         add_log(f"Wethr High error: {e}", "err", station)
@@ -653,9 +647,6 @@ def fetch_all(station="KOKC"):
                     add_log(f"{model}: WARNING raw_temp=None — check sample keys above.", "warn", station)
                 else:
                     add_log(f"{model}: high={raw_temp} now={current_temp} run={run_fmt} ({len(todays)} entries)", "ok", station)
-        except DailyCapExceeded:
-            add_log("Daily cap reached mid-fetch — stopping. Resets 3:30pm EST.", "warn", station)
-            break
         except Exception as e:
             errors.append(f"{model}: {e}")
             add_log(f"{model} error: {str(e)}", "warn", station)
@@ -1138,10 +1129,10 @@ def api_quota():
     return jsonify({
         "period": period,
         "count": count,
-        "cap": DAILY_REQUEST_CAP,
-        "remaining": max(0, DAILY_REQUEST_CAP - count),
-        "paused": count >= DAILY_REQUEST_CAP,
-        "resets": "3:30pm EST daily",
+        "cap": None,
+        "remaining": None,
+        "paused": False,
+        "resets": "3:30pm EST daily (counter only, not enforced)",
     })
 
 
