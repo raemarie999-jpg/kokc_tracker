@@ -1,4 +1,4 @@
-import os, json, time, threading, random, math
+import os, json, time, threading, random, math, fcntl
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, render_template_string
 import requests
@@ -11,6 +11,7 @@ API_KEY = os.environ.get("WETHR_API_KEY", "")
 DATA_DIR = "/data"
 PACING_FILE = f"{DATA_DIR}/pacing_snapshots.json"
 HISTORY_FILE = f"{DATA_DIR}/daily_history.json"
+_BGLOOP_LOCKFILE = f"{DATA_DIR}/bgloop.lock"
 
 # --- Rate limiting: max requests per second to wethr API ---
 _api_lock = threading.Lock()
@@ -864,15 +865,65 @@ def save_consensus_snapshot(station="KOKC"):
         add_log(f"Consensus snapshot error: {e}", "warn", station)
 
 
-# --- BUG P1 FIX: thread-safe, double-checked watchdog ---
+# --- BUG P1 FIX (in-process) + CROSS-PROCESS FIX ---
+# The lock above (_watchdog_lock) only prevents two threads in the SAME
+# process from racing to spawn bgloop. It does nothing if the app is served
+# by multiple OS processes (e.g. `gunicorn -w N` without --preload), because
+# `with app.app_context(): start_background()` at module import time runs
+# independently in EVERY worker process, each with its own fresh _started
+# flag and its own _watchdog_lock. Each worker then spawns its own bgloop
+# thread on its own schedule, and all of them hit the wethr API for the same
+# stations — this is exactly what produced the duplicate KOKC/KPHL fetch
+# batches ~15s apart in production logs.
+#
+# Fix: use an OS-level advisory file lock (flock) on a file in the shared
+# /data volume. Only the ONE process that successfully grabs this exclusive,
+# non-blocking lock is allowed to ever run background_loop(); every other
+# worker's watchdog call becomes a no-op. The lock is held for the lifetime
+# of that process (the fd is never closed), so if that worker dies/restarts,
+# the lock is released automatically and another worker can pick it up.
+_bgloop_lock_fd = None
+_bgloop_owner_checked = False
+_bgloop_owner_lock = threading.Lock()
+
+
+def _is_bgloop_owner():
+    """
+    Returns True if THIS process holds the exclusive cross-process bgloop
+    lock (acquiring it on first call if available). Returns False if some
+    other process already owns it. Safe to call repeatedly/concurrently.
+    """
+    global _bgloop_lock_fd, _bgloop_owner_checked
+    with _bgloop_owner_lock:
+        if _bgloop_owner_checked:
+            return _bgloop_lock_fd is not None
+        _bgloop_owner_checked = True
+        try:
+            ensure_data_dir()
+            fd = open(_BGLOOP_LOCKFILE, "w")
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fd.write(str(os.getpid()))
+            fd.flush()
+            _bgloop_lock_fd = fd
+            print(f"BGLOOP LOCK ACQUIRED by pid {os.getpid()} — this process owns background_loop()", flush=True)
+            return True
+        except (IOError, OSError):
+            print(f"BGLOOP LOCK held by another process — pid {os.getpid()} will not run background_loop()", flush=True)
+            return False
+
+
 def _ensure_background_thread_running():
     """
-    Make sure exactly one 'bgloop' thread is alive. Safe to call from many
-    concurrent requests: the cheap check happens first with no locking, and
-    only if that looks like bgloop is missing do we take the lock and check
-    again before spawning. This collapses what used to be a classic
-    check-then-act race (BUG P1) into a single winner.
+    Make sure exactly one 'bgloop' thread is alive, IN THIS PROCESS, and only
+    if this process is the cross-process bgloop owner (see _is_bgloop_owner).
+    Safe to call from many concurrent requests: the cheap check happens first
+    with no locking, and only if that looks like bgloop is missing do we take
+    the lock and check again before spawning. This collapses what used to be
+    a classic check-then-act race (BUG P1) into a single winner, both within
+    a process (_watchdog_lock) and across processes (_is_bgloop_owner).
     """
+    if not _is_bgloop_owner():
+        return
     for t in threading.enumerate():
         if t.name == "bgloop":
             return
@@ -2407,9 +2458,15 @@ def start_background():
             load_active_stations()
             for station in STATION_POOL:
                 load_accuracy(station)
-            t = threading.Thread(target=background_loop, daemon=True, name="bgloop")
-            t.start()
-            print("Background loop started")
+            # Route through the same cross-process ownership check used by the
+            # watchdog (see BUG P1 cross-process fix above) — only the worker
+            # that wins the flock on _BGLOOP_LOCKFILE actually starts a
+            # bgloop thread here. Every other worker still initializes its
+            # local state (active stations, accuracy data) above, since that
+            # in-memory state is per-process and each worker needs it to
+            # serve /api/state etc. — it just won't independently fetch.
+            _ensure_background_thread_running()
+            print(f"start_background() complete for pid {os.getpid()}", flush=True)
 
 
 with app.app_context():
