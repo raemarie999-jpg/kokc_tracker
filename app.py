@@ -1248,6 +1248,7 @@ th.default-col{color:var(--orange) !important}
   </div>
 
   <div class="card" id="pace-card" style="display:none">
+    <div class="ctitle">Model Pacing vs Current Obs (<span id="pace-obs">--</span>F)</div>
     <div class="pbars" id="pbars"></div>
     <div style="font-size:10px;color:var(--dimmer);margin-top:10px">Pace = current obs minus model forecast for this hour</div>
   </div>
