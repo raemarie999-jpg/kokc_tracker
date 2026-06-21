@@ -97,23 +97,47 @@ def save_json_file(path, data):
         add_log(f"Save error {path}: {e}", "err")
         return False
 
-STATIONS = ["KOKC", "KPHL", "KDCA"]
-STATION_NAMES = {
-    "KOKC": "Oklahoma City Will Rogers World Airport",
-    "KPHL": "Philadelphia International Airport",
-    "KDCA": "Washington Reagan National Airport",
+STATION_POOL = {
+    "KDCA": {"name": "Washington Reagan National Airport",       "lon_w": 77.04,  "tz": -5},
+    "KOKC": {"name": "Oklahoma City Will Rogers World Airport",  "lon_w": 97.60,  "tz": -6},
+    "KPHL": {"name": "Philadelphia International Airport",       "lon_w": 75.24,  "tz": -5},
+    "KBOS": {"name": "Boston Logan International Airport",       "lon_w": 71.01,  "tz": -5},
+    "KDEN": {"name": "Denver International Airport",             "lon_w": 104.67, "tz": -7},
+    "KHOU": {"name": "Houston Hobby Airport",                    "lon_w": 95.28,  "tz": -6},
+    "KLAS": {"name": "Las Vegas Harry Reid International",       "lon_w": 115.15, "tz": -8},
+    "KMDW": {"name": "Chicago Midway International Airport",     "lon_w": 87.75,  "tz": -6},
+    "KMSP": {"name": "Minneapolis-St. Paul International",       "lon_w": 93.22,  "tz": -6},
+    "KSAT": {"name": "San Antonio International Airport",        "lon_w": 98.47,  "tz": -6},
 }
-STATION_TZ_OFFSET = {
-    "KOKC": -6,
-    "KPHL": -5,
-    "KDCA": -5,
-}
-# Longitude degrees West — used for solar noon calculation
-STATION_LON_W = {
-    "KOKC": 97.60,
-    "KPHL": 75.24,
-    "KDCA": 77.04,
-}
+DEFAULT_ACTIVE_STATIONS = ["KOKC", "KPHL", "KDCA"]
+
+_active_stations = None
+_active_lock = threading.Lock()
+
+def load_active_stations():
+    global _active_stations
+    saved = load_json_file(f"{DATA_DIR}/active_stations.json", None)
+    if isinstance(saved, list):
+        valid = [s for s in saved if s in STATION_POOL]
+        if len(valid) == 3:
+            _active_stations = valid
+            return
+    _active_stations = list(DEFAULT_ACTIVE_STATIONS)
+
+def get_active_stations():
+    if _active_stations is None:
+        load_active_stations()
+    return list(_active_stations)
+
+def set_active_stations(stations):
+    global _active_stations
+    valid = [s for s in stations if s in STATION_POOL]
+    if len(valid) != 3:
+        return False
+    with _active_lock:
+        _active_stations = valid
+        save_json_file(f"{DATA_DIR}/active_stations.json", valid)
+    return True
 
 # --- Solar-adjusted nowcast high ---
 BOOST_BASE = 4.0          # midpoint of 3-5°F climatological range (clear summer day)
@@ -150,10 +174,13 @@ def make_state():
         "solar_noon_dt":  None,   # UTC datetime of that obs
     }
 
-states = {s: make_state() for s in STATIONS}
+states = {s: make_state() for s in STATION_POOL}
 
 def get_state(station=None):
-    return states.get(station or "KOKC", states["KOKC"])
+    if station and station in states:
+        return states[station]
+    active = get_active_stations()
+    return states.get(active[0], states[DEFAULT_ACTIVE_STATIONS[0]])
 
 def active_models(station="KOKC"):
     acc = get_state(station).get("accuracy", {})
@@ -240,11 +267,11 @@ def parse_vt(x):
     except: return None
 
 def station_local_now(station="KOKC"):
-    offset = STATION_TZ_OFFSET.get(station, -6)
+    offset = STATION_POOL.get(station, {}).get("tz", -6)
     return datetime.utcnow() + timedelta(hours=offset)
 
 def station_day_bounds(station="KOKC", offset=0):
-    tz_offset = STATION_TZ_OFFSET.get(station, -6)
+    tz_offset = STATION_POOL.get(station, {}).get("tz", -6)
     local_now = datetime.utcnow() + timedelta(hours=tz_offset)
     local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=offset)
     day_start_utc = local_midnight - timedelta(hours=tz_offset)
@@ -460,7 +487,7 @@ def fetch_all(station="KOKC"):
         )
         # Record solar noon obs if we're within ±30 min of solar noon
         try:
-            lon_w = STATION_LON_W.get(station)
+            lon_w = STATION_POOL.get(station, {}).get("lon_w")
             obs_temp = obs.get("temperature_display")
             if lon_w and obs_temp is not None:
                 sn_utc  = solar_noon_utc(lon_w)
@@ -505,7 +532,7 @@ def fetch_all(station="KOKC"):
         fetch_targets = ALL_KNOWN_MODELS
 
     utc_now = datetime.utcnow()
-    tz_offset = STATION_TZ_OFFSET.get(station, -6)
+    tz_offset = STATION_POOL.get(station, {}).get("tz", -6)
 
     # Sequential model fetches with throttling (handled inside wethr_get)
     for model in fetch_targets:
@@ -706,15 +733,14 @@ def build_snapshot_rows(station="KOKC"):
 
 def scheduled_fetch():
     """
-    Fetch each station sequentially with a generous gap between them.
+    Fetch each active station sequentially with a generous gap between them.
     Each station's model fetches are already serialized + throttled inside fetch_all.
     """
-    for i, station in enumerate(STATIONS):
+    active = get_active_stations()
+    for i, station in enumerate(active):
         if i > 0:
-            # Wait long enough for the previous station's fetches to finish
-            # and for the API to not consider it a burst.
             gap = 10 + random.uniform(2, 5)
-            add_log(f"Waiting {gap:.0f}s before fetching next station", "info", STATIONS[i-1])
+            add_log(f"Waiting {gap:.0f}s before fetching next station", "info", active[i-1])
             time.sleep(gap)
         try:
             fetch_all(station)
@@ -804,7 +830,7 @@ def background_loop():
         except Exception as e:
             print(f"Loop error: {e}")
         try:
-            for station in STATIONS:
+            for station in get_active_stations():
                 now = station_local_now(station)
                 if now.hour == 1:
                     rollup_daily_history(station)
@@ -820,7 +846,7 @@ def _get_prev_days(n, station="KOKC"):
 @app.route("/api/state")
 def api_state():
     station = request.args.get("station", "KOKC").upper()
-    if station not in STATIONS:
+    if station not in STATION_POOL:
         station = "KOKC"
     st = get_state(station)
     acc = st["accuracy"]
@@ -957,7 +983,7 @@ def api_state():
 @app.route("/api/history")
 def api_history():
     station = request.args.get("station", "KOKC").upper()
-    if station not in STATIONS:
+    if station not in STATION_POOL:
         station = "KOKC"
     history = load_json_file(f"{DATA_DIR}/history_{station}.json", {})
     return jsonify(history)
@@ -965,7 +991,7 @@ def api_history():
 @app.route("/api/accuracy", methods=["POST"])
 def save_accuracy():
     station = request.args.get("station", "KOKC").upper()
-    if station not in STATIONS:
+    if station not in STATION_POOL:
         station = "KOKC"
     get_state(station)["accuracy"] = request.json or {}
     add_log("Accuracy data updated", "ok", station)
@@ -975,7 +1001,7 @@ def save_accuracy():
 @app.route("/api/consensus_snapshots")
 def api_consensus_snapshots():
     station = request.args.get("station", "KOKC").upper()
-    if station not in STATIONS: station = "KOKC"
+    if station not in STATION_POOL: station = "KOKC"
     st = get_state(station)
     disk = load_json_file(f"{DATA_DIR}/consensus_{station}.json", {})
     return jsonify({
@@ -983,6 +1009,18 @@ def api_consensus_snapshots():
         "history": disk,
         "station": station,
     })
+@app.route("/api/station_pool")
+def api_station_pool():
+    return jsonify({"pool": STATION_POOL, "active": get_active_stations()})
+
+@app.route("/api/set_stations", methods=["POST"])
+def api_set_stations():
+    data = request.json or {}
+    stations = data.get("stations", [])
+    if set_active_stations(stations):
+        return jsonify({"ok": True, "active": get_active_stations()})
+    return jsonify({"ok": False, "error": "Need exactly 3 valid stations from the pool"}), 400
+
 @app.route("/api/quota")
 def api_quota():
     period = _get_period_key()
@@ -1010,7 +1048,7 @@ def api_debug():
     """Fetch one model raw and return the unprocessed API response for inspection."""
     station = request.args.get("station", "KOKC").upper()
     model = request.args.get("model", "HRRR")
-    if station not in STATIONS:
+    if station not in STATION_POOL:
         station = "KOKC"
     if not API_KEY:
         return jsonify({"error": "No API key set"})
@@ -1044,7 +1082,7 @@ def api_debug():
 @app.route("/api/refresh", methods=["POST"])
 def manual_refresh():
     station = request.args.get("station", "KOKC").upper()
-    if station not in STATIONS:
+    if station not in STATION_POOL:
         station = "KOKC"
     with _manual_refresh_lock:
         now = time.monotonic()
@@ -1296,6 +1334,15 @@ th.default-col{color:var(--orange) !important}
 <!-- MORNING ENTRY -->
 <div class="tab" id="tab-entry">
   <div class="card" style="border-color:#1e3a5f">
+    <div class="ctitle">Active Stations</div>
+    <p style="color:var(--dim);font-size:12px;line-height:1.7;margin-bottom:12px">Pick exactly 3 stations to monitor. Takes effect on the next auto-refresh cycle or immediately via the NOW button.</p>
+    <div id="station-picker-grid" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px"></div>
+    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button class="btn btn-green" onclick="saveActiveStations()">Save Active Stations</button>
+      <span id="station-save-status" style="font-size:10px;color:var(--dim)"></span>
+    </div>
+  </div>
+  <div class="card" style="border-color:#1e3a5f">
     <div class="ctitle">Fast Import &mdash; Paste JSON from Claude</div>
     <p style="color:var(--dim);font-size:12px;line-height:1.7;margin-bottom:12px">
       Each morning: screenshot accuracy tables, send to Claude, paste JSON here.
@@ -1424,14 +1471,22 @@ th.default-col{color:var(--orange) !important}
 </main>
 
 <script>
-var STATION_LIST = ["KOKC","KPHL","KDCA"];
+var STATION_POOL_DATA = {};  // populated by loadStationPool()
+var STATION_LIST = ["KOKC","KPHL","KDCA"];  // updated dynamically from server
 var STATION_NAMES = {
+  "KDCA": "Washington Reagan National Airport",
   "KOKC": "Oklahoma City Will Rogers World Airport",
   "KPHL": "Philadelphia International Airport",
-  "KDCA": "Washington Reagan National Airport"
+  "KBOS": "Boston Logan International Airport",
+  "KDEN": "Denver International Airport",
+  "KHOU": "Houston Hobby Airport",
+  "KLAS": "Las Vegas Harry Reid International",
+  "KMDW": "Chicago Midway International Airport",
+  "KMSP": "Minneapolis-St. Paul International",
+  "KSAT": "San Antonio International Airport",
 };
 var STATION = localStorage.getItem("active_station") || "KOKC";
-if(STATION_LIST.indexOf(STATION) === -1) STATION = "KOKC";
+// Will be corrected after loadStationPool() if no longer active
 
 var MODELS = [];
 var accData = {};
@@ -1440,8 +1495,42 @@ if(Object.keys(accData).length) MODELS = Object.keys(accData).filter(function(m)
 var countdown = 300;
 var countdownTimer;
 
+function buildStationButtons(){
+  var container = document.getElementById("station-btns");
+  if(!container) return;
+  container.innerHTML = "";
+  STATION_LIST.forEach(function(s){
+    var btn = document.createElement("button");
+    btn.id = "btn-"+s;
+    btn.textContent = s;
+    btn.className = "stn-btn " + (s === STATION ? "active" : "inactive");
+    btn.onclick = function(){ switchStation(s); };
+    container.appendChild(btn);
+  });
+}
+
+function loadStationPool(){
+  fetch("/api/station_pool").then(function(r){ return r.json(); }).then(function(data){
+    STATION_POOL_DATA = data.pool || {};
+    STATION_LIST = data.active || STATION_LIST;
+    // If saved station is no longer active, switch to first active
+    if(STATION_LIST.indexOf(STATION) === -1){
+      STATION = STATION_LIST[0];
+      localStorage.setItem("active_station", STATION);
+      try { accData = JSON.parse(localStorage.getItem("acc_"+STATION) || "{}"); } catch(e){ accData = {}; }
+      MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
+    }
+    buildStationButtons();
+    document.getElementById("page-sub").textContent = STATION_NAMES[STATION] || STATION;
+    document.getElementById("page-title").textContent = STATION + " \u00b7 Model Tracker";
+    renderStationPicker();
+  }).catch(function(){ buildStationButtons(); });
+}
+
+// Build initial buttons from defaults while loadStationPool() is in flight
 (function(){
   var container = document.getElementById("station-btns");
+  if(!container) return;
   STATION_LIST.forEach(function(s){
     var btn = document.createElement("button");
     btn.id = "btn-"+s;
@@ -1453,11 +1542,7 @@ var countdownTimer;
 })();
 
 function updateStationButtons(){
-  STATION_LIST.forEach(function(s){
-    var btn = document.getElementById("btn-"+s);
-    if(!btn) return;
-    btn.className = "stn-btn " + (s === STATION ? "active" : "inactive");
-  });
+  buildStationButtons();
 }
 
 function clearDisplay(){
@@ -1987,10 +2072,65 @@ function startCountdown(){
   },1000);
 }
 
+// --- Station picker ---
+var _selectedStations = STATION_LIST.slice();
+
+function renderStationPicker(){
+  var grid = document.getElementById("station-picker-grid");
+  if(!grid) return;
+  var allCodes = Object.keys(STATION_POOL_DATA).length ? Object.keys(STATION_POOL_DATA)
+    : ["KDCA","KOKC","KPHL","KBOS","KDEN","KHOU","KLAS","KMDW","KMSP","KSAT"];
+  grid.innerHTML = allCodes.map(function(code){
+    var active = _selectedStations.indexOf(code) >= 0;
+    return '<button onclick="togglePoolStation(\''+code+'\')" id="pool-btn-'+code+'" '
+      +'style="background:'+(active?"#1e40af":"none")+';border:1px solid '+(active?"#3b82f6":"#334155")+';'
+      +'color:'+(active?"#93c5fd":"#64748b")+';border-radius:4px;padding:6px 14px;font-size:11px;'
+      +'cursor:pointer;font-family:inherit;letter-spacing:1px">'+code+'</button>';
+  }).join("");
+}
+
+function togglePoolStation(code){
+  var idx = _selectedStations.indexOf(code);
+  if(idx >= 0){
+    if(_selectedStations.length > 1) _selectedStations.splice(idx, 1);
+  } else {
+    if(_selectedStations.length < 3) _selectedStations.push(code);
+  }
+  renderStationPicker();
+  var status = document.getElementById("station-save-status");
+  if(status) status.textContent = _selectedStations.length === 3 ? "" : "Select " + (3 - _selectedStations.length) + " more";
+}
+
+function saveActiveStations(){
+  var status = document.getElementById("station-save-status");
+  if(_selectedStations.length !== 3){
+    status.style.color = "var(--red)";
+    status.textContent = "Select exactly 3 stations.";
+    return;
+  }
+  fetch("/api/set_stations",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({stations:_selectedStations})})
+    .then(function(r){ return r.json(); })
+    .then(function(data){
+      if(data.ok){
+        STATION_LIST = data.active;
+        status.style.color = "var(--green)";
+        status.textContent = "Saved: " + data.active.join(", ");
+        buildStationButtons();
+        if(data.active.indexOf(STATION) < 0){
+          switchStation(data.active[0]);
+        }
+      } else {
+        status.style.color = "var(--red)";
+        status.textContent = data.error || "Error saving.";
+      }
+    });
+}
+
 document.getElementById("page-title").textContent = STATION + " \u00b7 Model Tracker";
 document.getElementById("page-sub").textContent = STATION_NAMES[STATION] || STATION;
 
 buildForms(); buildDefaultForm(); renderPreview(); poll(); startCountdown(); setInterval(poll,300000);
+loadStationPool();  // fetch active stations + update header buttons + render picker
 
 document.addEventListener("visibilitychange", function(){
   if(document.visibilityState === "visible"){ poll(); }
@@ -2096,7 +2236,8 @@ def start_background():
     with _start_lock:
         if not _started:
             _started = True
-            for station in STATIONS:
+            load_active_stations()
+            for station in STATION_POOL:
                 load_accuracy(station)
             t = threading.Thread(target=background_loop, daemon=True, name="bgloop")
             t.start()
