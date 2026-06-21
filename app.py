@@ -1454,36 +1454,6 @@ th.default-col{color:var(--orange) !important}
     <div class="sub" id="page-sub">Oklahoma City Will Rogers World Airport</div>
   </div>
   <div class="hright">
-    <div class="stat-pill">
-      <div class="lbl">Live Obs</div>
-      <div class="val" id="h-obs" style="color:var(--yellow)">--</div>
-      <div class="sub2" id="h-obs-t">awaiting</div>
-    </div>
-    <div class="sp"></div>
-    <div class="stat-pill">
-      <div class="lbl">Wethr High</div>
-      <div class="val" id="h-wh" style="color:var(--green)">--</div>
-      <div class="sub2">NWS logic</div>
-    </div>
-    <div class="sp"></div>
-    <div class="stat-pill">
-      <div class="lbl">Consensus</div>
-      <div class="val" id="h-con" style="color:var(--blue)">--</div>
-      <div class="sub2">MAE-weighted</div>
-    </div>
-    <div class="sp"></div>
-    <div class="stat-pill">
-      <div class="lbl">Tmr Consensus</div>
-      <div class="val" id="h-tmr" style="color:#a78bfa">--</div>
-      <div class="sub2">MAE-weighted</div>
-    </div>
-    <div class="sp"></div>
-    <div class="stat-pill">
-      <div class="lbl">Nowcast High</div>
-      <div class="val" id="h-nowcast" style="color:var(--orange)">--</div>
-      <div class="sub2" id="h-nowcast-note" style="max-width:120px;white-space:normal;line-height:1.3">awaiting solar noon</div>
-    </div>
-    <div class="sp"></div>
     <div style="display:flex;gap:6px;align-items:center" id="station-btns"></div>
     <div class="sp"></div>
     <div style="text-align:right">
@@ -1827,10 +1797,10 @@ function updateStationButtons(){
 }
 
 function clearDisplay(){
-  ["h-obs","h-wh","h-con","h-tmr","h-nowcast","s-obs","s-wh","s-con","s-tmr"].forEach(function(id){
+  ["s-obs","s-wh","s-con","s-tmr"].forEach(function(id){
     var el = document.getElementById(id); if(el) el.textContent="--";
   });
-  ["h-obs-t","s-obs-t"].forEach(function(id){
+  ["s-obs-t"].forEach(function(id){
     var el = document.getElementById(id); if(el) el.textContent="awaiting";
   });
   var tbody = document.getElementById("main-tbody"); if(tbody) tbody.innerHTML="";
@@ -2094,34 +2064,25 @@ function render(data){
   var con = data.consensus;
   if(obs){
     var t = obs.temperature_display;
-    document.getElementById("h-obs").textContent = t+"F";
     document.getElementById("s-obs").textContent = t+"F";
-    var ot = (obs.observation_time||"").slice(11,16)||"--";
-    document.getElementById("h-obs-t").textContent = ot;
     document.getElementById("pace-obs").textContent = t;
   }
-  if(wh){ document.getElementById("h-wh").textContent=wh.wethr_high+"F"; document.getElementById("s-wh").textContent=wh.wethr_high+"F"; }
-  if(con){ document.getElementById("h-con").textContent=con+"F"; document.getElementById("s-con").textContent=con+"F"; }
+  if(wh){ document.getElementById("s-wh").textContent=wh.wethr_high+"F"; }
+  if(con){ document.getElementById("s-con").textContent=con+"F"; }
   var tmrCon = data.tmr_consensus;
   if(tmrCon){
-    document.getElementById("h-tmr").textContent=tmrCon+"F";
     document.getElementById("s-tmr").textContent=tmrCon+"F";
   }
   // Solar-adjusted nowcast high
   var nc = data.nowcast;
   var ncSc = document.getElementById("nowcast-sc");
   if(nc && nc.nowcast != null){
-    document.getElementById("h-nowcast").textContent = nc.nowcast + "F";
-    document.getElementById("h-nowcast").style.color = nc.suppressed ? "var(--red)" : "var(--orange)";
-    document.getElementById("h-nowcast-note").textContent = nc.note;
     document.getElementById("s-nowcast").textContent = nc.nowcast + "F";
     document.getElementById("s-nowcast").style.color = nc.suppressed ? "var(--red)" : "var(--orange)";
     document.getElementById("s-nowcast-note").textContent =
       nc.solar_noon_obs + "F + " + nc.boost + "F \u00b7 " + nc.note;
     if(ncSc) ncSc.style.display = "";
   } else {
-    document.getElementById("h-nowcast").textContent = "--";
-    document.getElementById("h-nowcast-note").textContent = "awaiting solar noon";
     if(ncSc) ncSc.style.display = "none";
   }
   document.getElementById("s-mods").textContent = rows.filter(function(r){ return r.raw_high!=null; }).length+"/"+rows.length;
