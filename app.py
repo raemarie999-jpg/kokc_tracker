@@ -250,6 +250,20 @@ def wethr_get(path, retries=3):
                 print(f"[429] Rate limited on {path}. Waiting {wait:.1f}s (attempt {attempt+1})")
                 time.sleep(wait)
                 continue
+            if r.status_code == 400:
+                # --- DIAGNOSTIC FIX ---
+                # raise_for_status() alone only gives "400 Client Error: Bad
+                # Request for url: ..." — it discards the response body,
+                # which is usually where the API explains *why* (bad param
+                # name, model not available for this station, etc). Surface
+                # that body in the raised error and in the logs so 400s are
+                # actually debuggable instead of just "Bad Request".
+                body = (r.text or "")[:300]
+                print(f"[400] {path} -> {body}", flush=True)
+                raise requests.exceptions.HTTPError(
+                    f"400 Client Error: {body or '(empty body)'} for url: {r.url}",
+                    response=r
+                )
             r.raise_for_status()
             return r.json()
         except requests.exceptions.HTTPError as e:
@@ -1198,7 +1212,9 @@ def debug_threads():
 
 @app.route("/api/debug")
 def api_debug():
-    """Fetch one model raw and return the unprocessed API response for inspection."""
+    """Fetch one model raw and return the unprocessed API response for inspection,
+    including the actual response BODY on errors (not just the status code) so
+    400s are debuggable instead of opaque "Bad Request"."""
     station = request.args.get("station", "KOKC").upper()
     model = request.args.get("model", "HRRR")
     if station not in STATION_POOL:
@@ -1206,8 +1222,13 @@ def api_debug():
     if not API_KEY:
         return jsonify({"error": "No API key set"})
     results = {}
-    # Try every plausible parameter name combination
+    # Try every plausible parameter name combination, INCLUDING location_name
+    # since that's what the real production fetch loop (fetch_all) actually
+    # uses — it was missing from this list before, so /api/debug could never
+    # confirm whether the "working" shape was even being tested.
     attempts = [
+        f"forecasts.php?location_name={station}&model={requests.utils.quote(model)}",
+        f"forecasts.php?location_name={station}&model={requests.utils.quote(model)}&run=latest",
         f"forecasts.php?station_code={station}&model={requests.utils.quote(model)}&run=latest",
         f"forecasts.php?location_code={station}&model={requests.utils.quote(model)}&run=latest",
         f"forecasts.php?station={station}&model={requests.utils.quote(model)}&run=latest",
@@ -1215,12 +1236,22 @@ def api_debug():
         f"forecasts.php?station_code={station}&model={requests.utils.quote(model)}&run=0",
     ]
     for url in attempts:
+        full_url = f"https://wethr.net/api/v2/{url}"
         try:
-            data = wethr_get(url)
+            r = requests.get(full_url, headers={"X-API-Key": API_KEY}, timeout=10)
+            if r.status_code >= 400:
+                results[url] = {
+                    "status": "ERROR",
+                    "http_status": r.status_code,
+                    "response_body": (r.text or "")[:500],
+                }
+                continue
+            data = r.json()
             temps = data if isinstance(data, list) else data.get("forecasts", [])
             sample = temps[:2] if temps else []
             results[url] = {
                 "status": "OK",
+                "http_status": r.status_code,
                 "response_type": type(data).__name__,
                 "top_level_keys": list(data.keys()) if isinstance(data, dict) else "list",
                 "total_entries": len(temps),
