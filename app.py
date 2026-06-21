@@ -586,10 +586,29 @@ def fetch_all(station="KOKC"):
     utc_now = datetime.utcnow()
     tz_offset = STATION_POOL.get(station, {}).get("tz", -6)
 
+    # --- FIX: forecasts.php requires start_valid_time / end_valid_time ---
+    # The API rejected every forecasts.php call with HTTP 400:
+    #   {"error":"Missing required parameters.",
+    #    "details":["start_valid_time is required.","end_valid_time is required."]}
+    # These were never being sent. We need both today's and tomorrow's data
+    # (today_entries()/tomorrow_entries() below filter by local day boundaries
+    # for this station), so request a window covering today's local midnight
+    # through the end of tomorrow, expressed in UTC since that's what
+    # station_day_bounds()/parse_vt() work in everywhere else in this file.
+    today_start_utc, _ = station_day_bounds(station, 0)
+    _, tomorrow_end_utc = station_day_bounds(station, 1)
+    _VT_FMT = "%Y-%m-%d %H:%M"
+    start_valid_time = today_start_utc.strftime(_VT_FMT)
+    end_valid_time = tomorrow_end_utc.strftime(_VT_FMT)
+
     # Sequential model fetches with throttling (handled inside wethr_get)
     for model in fetch_targets:
         try:
-            data = wethr_get(f"forecasts.php?location_name={station}&model={requests.utils.quote(model)}")
+            data = wethr_get(
+                f"forecasts.php?location_name={station}&model={requests.utils.quote(model)}"
+                f"&start_valid_time={requests.utils.quote(start_valid_time)}"
+                f"&end_valid_time={requests.utils.quote(end_valid_time)}"
+            )
             temps = data if isinstance(data, list) else data.get("forecasts", [])
             meta = {} if isinstance(data, list) else data
             if temps:
@@ -1212,29 +1231,42 @@ def debug_threads():
 
 @app.route("/api/debug")
 def api_debug():
-    """Fetch one model raw and return the unprocessed API response for inspection,
-    including the actual response BODY on errors (not just the status code) so
-    400s are debuggable instead of opaque "Bad Request"."""
+    """Fetch one model raw and return the unprocessed API response for inspection.
+    Uses the confirmed-correct forecasts.php call shape (location_name +
+    start_valid_time + end_valid_time — discovered from wethr.net's own
+    "Missing required parameters" error body). Pass ?raw=1 to also try the
+    legacy guesswork variants for comparison if something still looks wrong."""
     station = request.args.get("station", "KOKC").upper()
     model = request.args.get("model", "HRRR")
     if station not in STATION_POOL:
         station = "KOKC"
     if not API_KEY:
         return jsonify({"error": "No API key set"})
+
+    today_start_utc, _ = station_day_bounds(station, 0)
+    _, tomorrow_end_utc = station_day_bounds(station, 1)
+    _VT_FMT = "%Y-%m-%d %H:%M"
+    start_valid_time = today_start_utc.strftime(_VT_FMT)
+    end_valid_time = tomorrow_end_utc.strftime(_VT_FMT)
+
+    correct_url = (
+        f"forecasts.php?location_name={station}&model={requests.utils.quote(model)}"
+        f"&start_valid_time={requests.utils.quote(start_valid_time)}"
+        f"&end_valid_time={requests.utils.quote(end_valid_time)}"
+    )
+    attempts = [correct_url]
+    if request.args.get("raw"):
+        # Legacy guesswork shapes, kept only for comparison/troubleshooting —
+        # none of these include the required time-range params either, so
+        # expect all of them to 400 with the same "Missing required parameters"
+        # body. They're here in case wethr.net ever changes the contract again.
+        attempts += [
+            f"forecasts.php?station_code={station}&model={requests.utils.quote(model)}&run=latest",
+            f"forecasts.php?location_code={station}&model={requests.utils.quote(model)}&run=latest",
+            f"forecasts.php?station={station}&model={requests.utils.quote(model)}&run=latest",
+        ]
+
     results = {}
-    # Try every plausible parameter name combination, INCLUDING location_name
-    # since that's what the real production fetch loop (fetch_all) actually
-    # uses — it was missing from this list before, so /api/debug could never
-    # confirm whether the "working" shape was even being tested.
-    attempts = [
-        f"forecasts.php?location_name={station}&model={requests.utils.quote(model)}",
-        f"forecasts.php?location_name={station}&model={requests.utils.quote(model)}&run=latest",
-        f"forecasts.php?station_code={station}&model={requests.utils.quote(model)}&run=latest",
-        f"forecasts.php?location_code={station}&model={requests.utils.quote(model)}&run=latest",
-        f"forecasts.php?station={station}&model={requests.utils.quote(model)}&run=latest",
-        f"forecasts.php?station_code={station}&model={requests.utils.quote(model)}",
-        f"forecasts.php?station_code={station}&model={requests.utils.quote(model)}&run=0",
-    ]
     for url in attempts:
         full_url = f"https://wethr.net/api/v2/{url}"
         try:
@@ -1257,7 +1289,6 @@ def api_debug():
                 "total_entries": len(temps),
                 "sample_entries": sample,
             }
-            break  # stop at first success
         except Exception as e:
             results[url] = {"status": "ERROR", "error": str(e)}
     return jsonify(results)
