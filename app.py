@@ -1392,8 +1392,9 @@ HTML = """<!DOCTYPE html>
   --orange:#fb923c;
 }
 body{background:var(--bg);color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:13px}
+.topbar{position:sticky;top:0;z-index:20;background:var(--bg3)}
 header{background:var(--bg3);border-bottom:1px solid var(--border);padding:14px 20px;
-  position:sticky;top:0;z-index:20;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
+  display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
 h1{font-size:18px;color:#e8f0f8;letter-spacing:-.5px}
 .sub{font-size:10px;color:var(--dim);letter-spacing:2px;text-transform:uppercase;margin-top:2px}
 .hright{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
@@ -1448,6 +1449,7 @@ th.default-col{color:var(--orange) !important}
 </style>
 </head>
 <body>
+<div class="topbar">
 <header>
   <div>
     <h1 id="page-title">KOKC &middot; Model Tracker</h1>
@@ -1473,6 +1475,7 @@ th.default-col{color:var(--orange) !important}
   <button onclick="showTab('history',this)">&#128196; History</button>
   <button onclick="showTab('snapshots',this)">&#128248; Snapshots</button>
 </nav>
+</div>
 <main>
 <!-- DASHBOARD -->
 <div class="tab active" id="tab-dashboard">
