@@ -24,6 +24,21 @@ _manual_refresh_lock = threading.Lock()
 _last_manual_refresh = {}
 MANUAL_REFRESH_COOLDOWN_SEC = 120  # min seconds between manual refreshes, per station
 
+# --- FIX: prevent two concurrent fetch_all() runs for the same station ---
+# manual_refresh() spawns a fresh thread to call fetch_all(station) directly,
+# completely independent of bgloop's own scheduled_fetch() loop. Nothing
+# previously stopped both from running for the same station at the same
+# time. Since every wethr_get() call is serialized through the same global
+# _api_lock/_throttle(), a second concurrent fetch_all() for one station
+# doesn't error — it just silently queues every one of its model requests
+# behind the other run's, each spaced MIN_REQUEST_INTERVAL apart, making the
+# whole thing take 2x+ as long with no distinguishing log output (add_log
+# doesn't tag which call/thread produced a line). That's a very plausible
+# explanation for "fetch looked healthy, then went quiet for minutes."
+# A simple per-station lock makes a second concurrent attempt for the same
+# station back off immediately and log why, instead of silently queuing.
+# (_fetch_locks itself is built just below, once STATION_POOL exists.)
+
 # --- Daily API call counter: informational only — NO cap is enforced.
 # Resets at 19:30 UTC (= 3:30pm EDT / 2:30pm EST) purely for display purposes
 # in /api/quota, so you can see usage trends without anything ever blocking
@@ -128,6 +143,12 @@ STATION_POOL = {
 DEFAULT_ACTIVE_STATIONS = ["KOKC", "KPHL", "KDCA"]
 _active_stations = None
 _active_lock = threading.Lock()
+
+# One lock per station so two concurrent fetch_all() calls for the SAME
+# station (e.g. bgloop's scheduled run + a manual refresh firing at the same
+# moment) can't silently queue behind each other for minutes — see comment
+# near MANUAL_REFRESH_COOLDOWN_SEC above for the full explanation.
+_fetch_locks = {s: threading.Lock() for s in STATION_POOL}
 
 
 def load_active_stations():
@@ -514,6 +535,33 @@ def compute_nowcast(station):
 
 
 def fetch_all(station="KOKC"):
+    """
+    Thin wrapper around _fetch_all_inner() that guarantees only one fetch can
+    run for a given station at a time. bgloop's scheduled_fetch() and a
+    manual /api/refresh both ultimately call this; without this lock they
+    could run concurrently for the same station with no error and no
+    distinguishing log output — each one's model requests just silently
+    queue behind the other's through the shared _api_lock/_throttle(),
+    making the whole thing take 2x+ as long for no visible reason (see the
+    long comment near _fetch_locks above).
+    """
+    lock = _fetch_locks.get(station)
+    if lock is None:
+        # Unknown station (shouldn't happen — callers validate against
+        # STATION_POOL — but don't silently skip a fetch over it).
+        _fetch_all_inner(station)
+        return
+    acquired = lock.acquire(blocking=False)
+    if not acquired:
+        add_log(f"Fetch already in progress for {station} — skipping concurrent call", "warn", station)
+        return
+    try:
+        _fetch_all_inner(station)
+    finally:
+        lock.release()
+
+
+def _fetch_all_inner(station="KOKC"):
     st = get_state(station)
     if not API_KEY:
         add_log("No API key set", "err", station)
