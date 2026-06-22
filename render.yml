@@ -3,7 +3,7 @@ services:
    name: kokc-tracker
    env: python
    buildCommand: pip install -r requirements.txt
-   startCommand: gunicorn app:app --workers 1 --threads 4 --bind 0.0.0.0:$PORT
+   startCommand: gunicorn app:app --workers 1 --worker-class gthread --threads 8 --bind 0.0.0.0:$PORT
    envVars:
      - key: WETHR_API_KEY
        sync: false
