@@ -2325,7 +2325,8 @@ function poll(){
   // GET never got served - UI frozen, zero errors in the Flask log.
   // Accuracy is now only POSTed when the user explicitly saves (saveAccuracy,
   // saveDefaults, loadFromJSON, clearAccuracy) - the correct set of call sites.
-  fetch("/api/state?station="+STATION).then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error("Poll error",e); });
+  fetch("/api/state?station="+STATION).then(function(r){ return r.json(); }).then(function(data){ try{ render(data); } catch(e){ document.getElementById("stxt").textContent="RENDER ERR: "+e.message; } }).catch(function(e){ document.getElementById("stxt").textContent="FETCH ERR: "+e.message; });
+
 }
 
 // --- BUG J4 FIX ---
