@@ -1,4 +1,4 @@
-import os, json, time, threading, random, math
+import os, json, time, threading, random
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, render_template_string
 import requests
@@ -97,57 +97,17 @@ def save_json_file(path, data):
         add_log(f"Save error {path}: {e}", "err")
         return False
 
-STATION_POOL = {
-    "KDCA": {"name": "Washington Reagan National Airport",       "lon_w": 77.04,  "tz": -5},
-    "KOKC": {"name": "Oklahoma City Will Rogers World Airport",  "lon_w": 97.60,  "tz": -6},
-    "KPHL": {"name": "Philadelphia International Airport",       "lon_w": 75.24,  "tz": -5},
-    "KBOS": {"name": "Boston Logan International Airport",       "lon_w": 71.01,  "tz": -5},
-    "KDEN": {"name": "Denver International Airport",             "lon_w": 104.67, "tz": -7},
-    "KHOU": {"name": "Houston Hobby Airport",                    "lon_w": 95.28,  "tz": -6},
-    "KLAS": {"name": "Las Vegas Harry Reid International",       "lon_w": 115.15, "tz": -8},
-    "KMDW": {"name": "Chicago Midway International Airport",     "lon_w": 87.75,  "tz": -6},
-    "KMSP": {"name": "Minneapolis-St. Paul International",       "lon_w": 93.22,  "tz": -6},
-    "KSAT": {"name": "San Antonio International Airport",        "lon_w": 98.47,  "tz": -6},
+STATIONS = ["KOKC", "KPHL", "KDCA"]
+STATION_NAMES = {
+    "KOKC": "Oklahoma City Will Rogers World Airport",
+    "KPHL": "Philadelphia International Airport",
+    "KDCA": "Washington Reagan National Airport",
 }
-DEFAULT_ACTIVE_STATIONS = ["KOKC", "KPHL", "KDCA"]
-
-_active_stations = None
-_active_lock = threading.Lock()
-
-def load_active_stations():
-    global _active_stations
-    saved = load_json_file(f"{DATA_DIR}/active_stations.json", None)
-    if isinstance(saved, list):
-        valid = [s for s in saved if s in STATION_POOL]
-        if len(valid) == 3:
-            _active_stations = valid
-            return
-    _active_stations = list(DEFAULT_ACTIVE_STATIONS)
-
-def get_active_stations():
-    if _active_stations is None:
-        load_active_stations()
-    return list(_active_stations)
-
-def set_active_stations(stations):
-    global _active_stations
-    valid = [s for s in stations if s in STATION_POOL]
-    if len(valid) != 3:
-        return False
-    with _active_lock:
-        _active_stations = valid
-        save_json_file(f"{DATA_DIR}/active_stations.json", valid)
-    return True
-
-# --- Solar-adjusted nowcast high ---
-BOOST_BASE = 4.0          # midpoint of 3-5°F climatological range (clear summer day)
-SKY_BOOST_FACTOR = {
-    "SKC": 1.0, "CLR": 1.0, "CAVOK": 1.0, "NSC": 1.0, "FEW": 1.0,
-    "SCT": 0.6,
-    "BKN": 0.25,
-    "OVC": 0.05, "OVX": 0.05, "VV": 0.05,
+STATION_TZ_OFFSET = {
+    "KOKC": -6,
+    "KPHL": -5,
+    "KDCA": -5,
 }
-NORTHERLY_DIRS = {"N", "NNE", "NNW", "NE", "NW"}  # suppress boost if METAR wind is any of these
 
 ALL_KNOWN_MODELS = [
     "ARPEGE","HRRR","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NAM-MOS","NBM",
@@ -169,18 +129,12 @@ def make_state():
         "log": [],
         "today_avg_pace": {},
         "consensus_snapshots": [],
-        "metar": None,
-        "solar_noon_obs": None,   # obs temp recorded closest to solar noon
-        "solar_noon_dt":  None,   # UTC datetime of that obs
     }
 
-states = {s: make_state() for s in STATION_POOL}
+states = {s: make_state() for s in STATIONS}
 
 def get_state(station=None):
-    if station and station in states:
-        return states[station]
-    active = get_active_stations()
-    return states.get(active[0], states[DEFAULT_ACTIVE_STATIONS[0]])
+    return states.get(station or "KOKC", states["KOKC"])
 
 def active_models(station="KOKC"):
     acc = get_state(station).get("accuracy", {})
@@ -267,11 +221,11 @@ def parse_vt(x):
     except: return None
 
 def station_local_now(station="KOKC"):
-    offset = STATION_POOL.get(station, {}).get("tz", -6)
+    offset = STATION_TZ_OFFSET.get(station, -6)
     return datetime.utcnow() + timedelta(hours=offset)
 
 def station_day_bounds(station="KOKC", offset=0):
-    tz_offset = STATION_POOL.get(station, {}).get("tz", -6)
+    tz_offset = STATION_TZ_OFFSET.get(station, -6)
     local_now = datetime.utcnow() + timedelta(hours=tz_offset)
     local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=offset)
     day_start_utc = local_midnight - timedelta(hours=tz_offset)
@@ -327,135 +281,6 @@ def get_run_data(acc_model, run_key):
     # 3. Nothing run-specific found
     return {}, "overall"
 
-def deg_to_cardinal(deg):
-    """Convert wind direction degrees to 16-point cardinal direction."""
-    if deg is None:
-        return None
-    dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE","S","SSW","SW","WSW","W","WNW","NW","NNW"]
-    return dirs[round(float(deg) / (360 / len(dirs))) % len(dirs)]
-
-def _sf(v):
-    """Safe float: returns rounded float or None. Guards against NaN/Infinity."""
-    try:
-        if v is None:
-            return None
-        result = round(float(v), 1)
-        if math.isnan(result) or math.isinf(result):
-            return None
-        return result
-    except:
-        return None
-
-_SKY_LABELS = {
-    "SKC":"Clear","CLR":"Clear","CAVOK":"Clear","NSC":"Clear",
-    "FEW":"Few","SCT":"Scattered","BKN":"Broken","OVC":"Overcast","OVX":"Obscured","VV":"Obscured"
-}
-_SKY_PRIORITY = {"SKC":0,"CLR":0,"CAVOK":0,"NSC":0,"FEW":1,"SCT":2,"BKN":3,"OVC":4,"OVX":4,"VV":4}
-
-def fetch_metar(station):
-    """Fetch latest METAR from aviationweather.gov — free, no key, separate from wethr budget."""
-    url = f"https://aviationweather.gov/api/data/metar?ids={station}&format=json&hours=2"
-    r = requests.get(url, timeout=8, headers={"User-Agent": "WeatherTracker/1.0"})
-    r.raise_for_status()
-    data = r.json()
-    if not data:
-        return None
-    m = data[0]
-
-    # Sky layers
-    sky_layers = m.get("sky") or []
-    cover_label = "CLR"
-    ceiling_ft = None
-    sky_parts = []
-    for layer in sky_layers:
-        cov = layer.get("cover", "")
-        base = layer.get("base")
-        sky_parts.append(f"{cov}{str(int(base/100)).zfill(3) if base is not None else '///'}")
-        if _SKY_PRIORITY.get(cov, 0) > _SKY_PRIORITY.get(cover_label, 0):
-            cover_label = cov
-        if cov in ("BKN","OVC","OVX","VV") and base is not None:
-            if ceiling_ft is None or int(base) < ceiling_ft:
-                ceiling_ft = int(base)
-
-    def kt_mph(v):
-        try: return round(float(v) * 1.15078, 1)
-        except: return None
-
-    def c_to_f(c):
-        try: return round(float(c) * 9/5 + 32, 1)
-        except: return None
-
-    wdir = m.get("wdir")
-    if wdir == 360: wdir = 0
-
-    return {
-        "sky_cover":     cover_label,
-        "sky_label":     _SKY_LABELS.get(cover_label, cover_label),
-        "sky_layers":    sky_parts,
-        "ceiling_ft":    ceiling_ft,
-        "wind_dir_deg":  wdir,
-        "wind_dir_card": deg_to_cardinal(wdir),
-        "wind_speed_kt": m.get("wspd"),
-        "wind_speed_mph": kt_mph(m.get("wspd")),
-        "wind_gust_kt":  m.get("wgst"),
-        "wind_gust_mph": kt_mph(m.get("wgst")),
-        "visibility_sm": m.get("visib"),
-        "temp_f":        c_to_f(m.get("temp")),
-        "dew_f":         c_to_f(m.get("dewp")),
-        "obs_time_utc":  m.get("reportTime"),
-        "raw":           m.get("rawOb"),
-    }
-
-def solar_noon_utc(lon_deg_west, date=None):
-    """Returns solar noon as a UTC datetime for the given longitude (degrees West)."""
-    if date is None:
-        date = datetime.utcnow().date()
-    doy = date.timetuple().tm_yday
-    B = math.radians(360 / 365 * (doy - 81))
-    eot_min = 9.87 * math.sin(2*B) - 7.53 * math.cos(B) - 1.5 * math.sin(B)
-    solar_noon_h = 12.0 + lon_deg_west / 15.0 - eot_min / 60.0
-    h = int(solar_noon_h)
-    frac = solar_noon_h - h
-    m = int(frac * 60)
-    s = int((frac * 60 - m) * 60)
-    return datetime(date.year, date.month, date.day, max(0, min(23, h)), m, s)
-
-def compute_nowcast(station):
-    """
-    Solar-adjusted nowcast high.
-    Uses recorded solar noon obs + tiered sky boost scaled by METAR wind direction flag.
-    Returns None if solar noon obs hasn't been recorded yet today.
-    """
-    st = get_state(station)
-    solar_noon_obs = st.get("solar_noon_obs")
-    if solar_noon_obs is None:
-        return None
-
-    metar = st.get("metar")
-    sky_cover   = metar.get("sky_cover", "CLR") if metar else "CLR"
-    wind_card   = metar.get("wind_dir_card")     if metar else None
-
-    if wind_card in NORTHERLY_DIRS:
-        boost     = round(BOOST_BASE * 0.05, 1)
-        note      = f"N wind suppressed ({wind_card})"
-        suppressed = True
-    else:
-        sky_factor = SKY_BOOST_FACTOR.get(sky_cover, 1.0)
-        boost      = round(BOOST_BASE * sky_factor, 1)
-        note       = f"{_SKY_LABELS.get(sky_cover, sky_cover)} ({int(sky_factor*100)}%)"
-        suppressed  = False
-
-    nowcast = round(solar_noon_obs + boost, 1)
-    return {
-        "nowcast":        nowcast,
-        "solar_noon_obs": solar_noon_obs,
-        "boost":          boost,
-        "note":           note,
-        "suppressed":     suppressed,
-        "sky_cover":      sky_cover,
-        "wind_card":      wind_card,
-    }
-
 def fetch_all(station="KOKC"):
     st = get_state(station)
     if not API_KEY:
@@ -485,28 +310,6 @@ def fetch_all(station="KOKC"):
             "ok",
             station
         )
-        # Record solar noon obs if we're within ±30 min of solar noon
-        try:
-            lon_w = STATION_POOL.get(station, {}).get("lon_w")
-            obs_temp = obs.get("temperature_display")
-            if lon_w and obs_temp is not None:
-                sn_utc  = solar_noon_utc(lon_w)
-                now_utc = datetime.utcnow()
-                # Reset if stored obs is from a previous day
-                sn_dt = st.get("solar_noon_dt")
-                if sn_dt and sn_dt.date() < now_utc.date():
-                    st["solar_noon_obs"] = None
-                    st["solar_noon_dt"]  = None
-                diff_min = abs((now_utc - sn_utc).total_seconds() / 60)
-                if diff_min <= 30:
-                    existing = st.get("solar_noon_dt")
-                    existing_diff = abs((existing - sn_utc).total_seconds() / 60) if existing else 9999
-                    if existing is None or diff_min < existing_diff:
-                        st["solar_noon_obs"] = float(obs_temp)
-                        st["solar_noon_dt"]  = now_utc
-                        add_log(f"Solar noon obs: {obs_temp}F ({diff_min:.0f}min from solar noon)", "ok", station)
-        except Exception as e:
-            add_log(f"Solar noon record error (non-fatal): {e}", "warn", station)
     except DailyCapExceeded as e:
         add_log(f"Daily cap reached — stopping fetch. Resets 3:30pm EST.", "warn", station)
         return
@@ -532,7 +335,7 @@ def fetch_all(station="KOKC"):
         fetch_targets = ALL_KNOWN_MODELS
 
     utc_now = datetime.utcnow()
-    tz_offset = STATION_POOL.get(station, {}).get("tz", -6)
+    tz_offset = STATION_TZ_OFFSET.get(station, -6)
 
     # Sequential model fetches with throttling (handled inside wethr_get)
     for model in fetch_targets:
@@ -567,26 +370,6 @@ def fetch_all(station="KOKC"):
                         local_vt = vt + timedelta(hours=tz_offset)
                         tmr_low_time = local_vt.strftime("%-I:%M%p").lower()
 
-                # Conditions at peak temp hour
-                wind_at_peak  = _sf(max_entry.get("wind_speed_mph"))
-                wind_dir      = _sf(max_entry.get("wind_direction_deg"))
-                cloud_at_peak = _sf(max_entry.get("cloud_cover"))
-                dew_at_peak   = _sf(max_entry.get("dew_point_f"))
-                humid_at_peak = _sf(max_entry.get("relative_humidity"))
-
-                # Day-wide: max gust and total precip
-                max_gust = None
-                total_precip = 0.0
-                has_precip = False
-                for entry in todays:
-                    g = _sf(entry.get("wind_gusts_mph"))
-                    if g is not None and (max_gust is None or g > max_gust):
-                        max_gust = g
-                    p = entry.get("precipitation_in")
-                    if p is not None:
-                        try: total_precip += float(p); has_precip = True
-                        except: pass
-
                 st["forecasts"][model] = {
                     "high": raw_temp,
                     "current_fcst": current_temp,
@@ -594,15 +377,6 @@ def fetch_all(station="KOKC"):
                     "tmr_high": tmr_temp,
                     "tmr_low": tmr_low,
                     "tmr_low_time": tmr_low_time,
-                    # Conditions
-                    "wind_speed_mph":  wind_at_peak,
-                    "wind_dir_deg":    wind_dir,
-                    "wind_dir_card":   deg_to_cardinal(wind_dir),
-                    "wind_gust_mph":   max_gust,
-                    "cloud_cover":     cloud_at_peak,
-                    "dew_point_f":     dew_at_peak,
-                    "humidity_pct":    humid_at_peak,
-                    "precip_in":       round(total_precip, 3) if has_precip else None,
                 }
                 if raw_temp is None:
                     add_log(f"{model}: WARNING raw_temp=None — check sample keys above. entry keys={list(max_entry.keys())}", "warn", station)
@@ -620,20 +394,6 @@ def fetch_all(station="KOKC"):
     st["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     st["errors"] = errors
     add_log(f"Done. {len(st['forecasts'])} models loaded.", "ok", station)
-
-    # METAR — free, separate API, doesn't count against wethr budget
-    try:
-        metar = fetch_metar(station)
-        st["metar"] = metar
-        if metar:
-            add_log(
-                f"METAR: {metar['sky_label']} {' '.join(metar['sky_layers'])} "
-                f"wind={metar.get('wind_dir_card','?')}@{metar.get('wind_speed_mph','?')}mph "
-                f"vis={metar.get('visibility_sm','?')}SM",
-                "ok", station
-            )
-    except Exception as e:
-        add_log(f"METAR error (non-fatal): {e}", "warn", station)
 
     try:
         rows = build_snapshot_rows(station)
@@ -733,14 +493,15 @@ def build_snapshot_rows(station="KOKC"):
 
 def scheduled_fetch():
     """
-    Fetch each active station sequentially with a generous gap between them.
+    Fetch each station sequentially with a generous gap between them.
     Each station's model fetches are already serialized + throttled inside fetch_all.
     """
-    active = get_active_stations()
-    for i, station in enumerate(active):
+    for i, station in enumerate(STATIONS):
         if i > 0:
+            # Wait long enough for the previous station's fetches to finish
+            # and for the API to not consider it a burst.
             gap = 10 + random.uniform(2, 5)
-            add_log(f"Waiting {gap:.0f}s before fetching next station", "info", active[i-1])
+            add_log(f"Waiting {gap:.0f}s before fetching next station", "info", STATIONS[i-1])
             time.sleep(gap)
         try:
             fetch_all(station)
@@ -830,7 +591,7 @@ def background_loop():
         except Exception as e:
             print(f"Loop error: {e}")
         try:
-            for station in get_active_stations():
+            for station in STATIONS:
                 now = station_local_now(station)
                 if now.hour == 1:
                     rollup_daily_history(station)
@@ -846,7 +607,7 @@ def _get_prev_days(n, station="KOKC"):
 @app.route("/api/state")
 def api_state():
     station = request.args.get("station", "KOKC").upper()
-    if station not in STATION_POOL:
+    if station not in STATIONS:
         station = "KOKC"
     st = get_state(station)
     acc = st["accuracy"]
@@ -894,15 +655,6 @@ def api_state():
             "tmr_low": tmr_low, "tmr_low_adj": tmr_low_adj, "tmr_low_time": tmr_low_time,
             "mae": display_mae, "rmse": a.get("rmse"),
             "runs": a.get("runs", {}),
-            # Conditions
-            "wind_speed_mph": fcst.get("wind_speed_mph"),
-            "wind_dir_deg":   fcst.get("wind_dir_deg"),
-            "wind_dir_card":  fcst.get("wind_dir_card"),
-            "wind_gust_mph":  fcst.get("wind_gust_mph"),
-            "cloud_cover":    fcst.get("cloud_cover"),
-            "dew_point_f":    fcst.get("dew_point_f"),
-            "humidity_pct":   fcst.get("humidity_pct"),
-            "precip_in":      fcst.get("precip_in"),
         })
 
     w_sum, w_total = 0, 0
@@ -930,40 +682,6 @@ def api_state():
                 w = 1/mae; tw_sum += tadj*w; tw_total += w
         except: pass
     tmr_consensus = round(tw_sum/tw_total, 1) if tw_total > 0 else None
-
-    # Conditions consensus (MAE-weighted) — wrapped so any failure can't break api/state
-    cond_consensus = {}
-    nowcast_data = None
-    try:
-        for field in ("wind_speed_mph", "wind_gust_mph", "cloud_cover", "dew_point_f", "humidity_pct", "precip_in"):
-            ws, wt = 0, 0
-            for r in rows:
-                try:
-                    mae = float(r["mae"]); v = r.get(field)
-                    if mae > 0 and v is not None:
-                        w = 1/mae; ws += float(v)*w; wt += w
-                except: pass
-            if wt > 0:
-                cond_consensus[field] = round(ws/wt, 2)
-        # Wind direction: vector average to handle 0/360 wrap
-        sin_s, cos_s, wd_tot = 0, 0, 0
-        for r in rows:
-            try:
-                mae = float(r["mae"]); wd = r.get("wind_dir_deg")
-                if mae > 0 and wd is not None:
-                    w = 1/mae
-                    sin_s += w * math.sin(math.radians(float(wd)))
-                    cos_s += w * math.cos(math.radians(float(wd)))
-                    wd_tot += w
-            except: pass
-        if wd_tot > 0:
-            avg_wd = math.degrees(math.atan2(sin_s/wd_tot, cos_s/wd_tot)) % 360
-            cond_consensus["wind_dir_deg"]  = round(avg_wd)
-            cond_consensus["wind_dir_card"] = deg_to_cardinal(round(avg_wd))
-        nowcast_data = compute_nowcast(station)
-    except Exception as e:
-        print(f"Conditions/nowcast compute error (non-fatal): {e}", flush=True)
-
     return jsonify({
         "station": station, "obs": st["obs"], "wethr_high": st["wethr_high"],
         "rows": rows, "consensus": consensus,
@@ -975,15 +693,12 @@ def api_state():
         "today_avg_pace": st["today_avg_pace"],
         "today_snapshot_count": len(load_json_file(f"{DATA_DIR}/pacing_{station}.json", {}).get(station_local_now(station).strftime("%Y-%m-%d"), [])),
         "prev_days": _get_prev_days(3, station),
-        "metar": st.get("metar"),
-        "conditions_consensus": cond_consensus,
-        "nowcast": nowcast_data,
     })
 
 @app.route("/api/history")
 def api_history():
     station = request.args.get("station", "KOKC").upper()
-    if station not in STATION_POOL:
+    if station not in STATIONS:
         station = "KOKC"
     history = load_json_file(f"{DATA_DIR}/history_{station}.json", {})
     return jsonify(history)
@@ -991,7 +706,7 @@ def api_history():
 @app.route("/api/accuracy", methods=["POST"])
 def save_accuracy():
     station = request.args.get("station", "KOKC").upper()
-    if station not in STATION_POOL:
+    if station not in STATIONS:
         station = "KOKC"
     get_state(station)["accuracy"] = request.json or {}
     add_log("Accuracy data updated", "ok", station)
@@ -1001,7 +716,7 @@ def save_accuracy():
 @app.route("/api/consensus_snapshots")
 def api_consensus_snapshots():
     station = request.args.get("station", "KOKC").upper()
-    if station not in STATION_POOL: station = "KOKC"
+    if station not in STATIONS: station = "KOKC"
     st = get_state(station)
     disk = load_json_file(f"{DATA_DIR}/consensus_{station}.json", {})
     return jsonify({
@@ -1009,18 +724,6 @@ def api_consensus_snapshots():
         "history": disk,
         "station": station,
     })
-@app.route("/api/station_pool")
-def api_station_pool():
-    return jsonify({"pool": STATION_POOL, "active": get_active_stations()})
-
-@app.route("/api/set_stations", methods=["POST"])
-def api_set_stations():
-    data = request.json or {}
-    stations = data.get("stations", [])
-    if set_active_stations(stations):
-        return jsonify({"ok": True, "active": get_active_stations()})
-    return jsonify({"ok": False, "error": "Need exactly 3 valid stations from the pool"}), 400
-
 @app.route("/api/quota")
 def api_quota():
     period = _get_period_key()
@@ -1048,7 +751,7 @@ def api_debug():
     """Fetch one model raw and return the unprocessed API response for inspection."""
     station = request.args.get("station", "KOKC").upper()
     model = request.args.get("model", "HRRR")
-    if station not in STATION_POOL:
+    if station not in STATIONS:
         station = "KOKC"
     if not API_KEY:
         return jsonify({"error": "No API key set"})
@@ -1082,7 +785,7 @@ def api_debug():
 @app.route("/api/refresh", methods=["POST"])
 def manual_refresh():
     station = request.args.get("station", "KOKC").upper()
-    if station not in STATION_POOL:
+    if station not in STATIONS:
         station = "KOKC"
     with _manual_refresh_lock:
         now = time.monotonic()
@@ -1208,12 +911,6 @@ th.default-col{color:var(--orange) !important}
       <div class="sub2">MAE-weighted</div>
     </div>
     <div class="sp"></div>
-    <div class="stat-pill">
-      <div class="lbl">Nowcast High</div>
-      <div class="val" id="h-nowcast" style="color:var(--orange)">--</div>
-      <div class="sub2" id="h-nowcast-note" style="max-width:120px;white-space:normal;line-height:1.3">solar adj</div>
-    </div>
-    <div class="sp"></div>
     <div style="display:flex;gap:6px;align-items:center" id="station-btns"></div>
     <div class="sp"></div>
     <div style="text-align:right">
@@ -1245,7 +942,6 @@ th.default-col{color:var(--orange) !important}
     <div class="sc"><div class="lbl">Consensus High</div><div class="v" id="s-con" style="color:var(--blue)">--</div><div class="s">MAE-weighted adj</div></div>
     <div class="sc"><div class="lbl">Models Live</div><div class="v" id="s-mods" style="color:var(--purple)">--</div><div class="s">forecast runs</div></div>
     <div class="sc"><div class="lbl">Tmr Consensus</div><div class="v" id="s-tmr" style="color:#a78bfa">--</div><div class="s">MAE-weighted adj</div></div>
-    <div class="sc" id="nowcast-sc" style="display:none"><div class="lbl">Nowcast High</div><div class="v" id="s-nowcast" style="color:var(--orange)">--</div><div class="s" id="s-nowcast-note" style="white-space:normal;line-height:1.4">solar adj</div></div>
   </div>
 
   <div class="card">
@@ -1259,29 +955,6 @@ th.default-col{color:var(--orange) !important}
         <thead><tr><th>#</th><th>Model</th><th>Run</th><th>Fcst High</th><th>Correction</th><th>Adj High</th><th>Obs Pace</th><th>Tmr High</th><th>Tmr Adj</th><th>Tmr Low</th><th>Low Adj</th><th>Low Time</th><th>MAE</th><th>RMSE</th></tr></thead>
         <tbody id="main-tbody"></tbody>
       </table>
-    </div>
-  </div>
-
-  <!-- CONDITIONS CARD -->
-  <div class="card" id="conditions-card" style="display:none">
-    <div class="ctitle">Conditions</div>
-    <div style="font-size:10px;letter-spacing:1.5px;color:var(--dim);text-transform:uppercase;margin-bottom:8px">
-      Surface Obs (METAR) &middot; <span id="metar-time" style="color:var(--dimmer)">--</span>
-    </div>
-    <div class="srow" style="margin-bottom:14px">
-      <div class="sc"><div class="lbl">Sky Cover</div><div class="v" id="metar-sky" style="color:var(--blue);font-size:16px">--</div><div class="s" id="metar-ceil">--</div></div>
-      <div class="sc"><div class="lbl">Surface Wind</div><div class="v" id="metar-wind" style="color:var(--text);font-size:16px">--</div><div class="s" id="metar-gust">--</div></div>
-      <div class="sc"><div class="lbl">Visibility</div><div class="v" id="metar-vis" style="color:var(--text);font-size:16px">--</div><div class="s">statute miles</div></div>
-    </div>
-    <div style="font-size:10px;letter-spacing:1.5px;color:var(--dim);text-transform:uppercase;margin-bottom:8px">
-      Model Consensus &middot; At Peak Temp Hour
-    </div>
-    <div class="srow" style="margin-bottom:0">
-      <div class="sc"><div class="lbl">Wind at Peak</div><div class="v" id="cond-wind" style="color:var(--text);font-size:16px">--</div><div class="s" id="cond-wind-dir">--</div></div>
-      <div class="sc"><div class="lbl">Max Day Gust</div><div class="v" id="cond-gust" style="color:var(--orange);font-size:16px">--</div><div class="s">day-wide max</div></div>
-      <div class="sc"><div class="lbl">Cloud Cover</div><div class="v" id="cond-cloud" style="color:var(--blue);font-size:16px">--</div><div class="s">at peak hour</div></div>
-      <div class="sc"><div class="lbl">Dew Point</div><div class="v" id="cond-dew" style="color:var(--purple);font-size:16px">--</div><div class="s" id="cond-humid">--</div></div>
-      <div class="sc"><div class="lbl">Day Precip</div><div class="v" id="cond-precip" style="color:var(--dim);font-size:16px">--</div><div class="s">model consensus</div></div>
     </div>
   </div>
 
@@ -1333,15 +1006,6 @@ th.default-col{color:var(--orange) !important}
 
 <!-- MORNING ENTRY -->
 <div class="tab" id="tab-entry">
-  <div class="card" style="border-color:#1e3a5f">
-    <div class="ctitle">Active Stations</div>
-    <p style="color:var(--dim);font-size:12px;line-height:1.7;margin-bottom:12px">Pick exactly 3 stations to monitor. Takes effect on the next auto-refresh cycle or immediately via the NOW button.</p>
-    <div id="station-picker-grid" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px"></div>
-    <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-      <button class="btn btn-green" onclick="saveActiveStations()">Save Active Stations</button>
-      <span id="station-save-status" style="font-size:10px;color:var(--dim)"></span>
-    </div>
-  </div>
   <div class="card" style="border-color:#1e3a5f">
     <div class="ctitle">Fast Import &mdash; Paste JSON from Claude</div>
     <p style="color:var(--dim);font-size:12px;line-height:1.7;margin-bottom:12px">
@@ -1471,22 +1135,14 @@ th.default-col{color:var(--orange) !important}
 </main>
 
 <script>
-var STATION_POOL_DATA = {};  // populated by loadStationPool()
-var STATION_LIST = ["KOKC","KPHL","KDCA"];  // updated dynamically from server
+var STATION_LIST = ["KOKC","KPHL","KDCA"];
 var STATION_NAMES = {
-  "KDCA": "Washington Reagan National Airport",
   "KOKC": "Oklahoma City Will Rogers World Airport",
   "KPHL": "Philadelphia International Airport",
-  "KBOS": "Boston Logan International Airport",
-  "KDEN": "Denver International Airport",
-  "KHOU": "Houston Hobby Airport",
-  "KLAS": "Las Vegas Harry Reid International",
-  "KMDW": "Chicago Midway International Airport",
-  "KMSP": "Minneapolis-St. Paul International",
-  "KSAT": "San Antonio International Airport",
+  "KDCA": "Washington Reagan National Airport"
 };
 var STATION = localStorage.getItem("active_station") || "KOKC";
-// Will be corrected after loadStationPool() if no longer active
+if(STATION_LIST.indexOf(STATION) === -1) STATION = "KOKC";
 
 var MODELS = [];
 var accData = {};
@@ -1495,42 +1151,8 @@ if(Object.keys(accData).length) MODELS = Object.keys(accData).filter(function(m)
 var countdown = 300;
 var countdownTimer;
 
-function buildStationButtons(){
-  var container = document.getElementById("station-btns");
-  if(!container) return;
-  container.innerHTML = "";
-  STATION_LIST.forEach(function(s){
-    var btn = document.createElement("button");
-    btn.id = "btn-"+s;
-    btn.textContent = s;
-    btn.className = "stn-btn " + (s === STATION ? "active" : "inactive");
-    btn.onclick = function(){ switchStation(s); };
-    container.appendChild(btn);
-  });
-}
-
-function loadStationPool(){
-  fetch("/api/station_pool").then(function(r){ return r.json(); }).then(function(data){
-    STATION_POOL_DATA = data.pool || {};
-    STATION_LIST = data.active || STATION_LIST;
-    // If saved station is no longer active, switch to first active
-    if(STATION_LIST.indexOf(STATION) === -1){
-      STATION = STATION_LIST[0];
-      localStorage.setItem("active_station", STATION);
-      try { accData = JSON.parse(localStorage.getItem("acc_"+STATION) || "{}"); } catch(e){ accData = {}; }
-      MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
-    }
-    buildStationButtons();
-    document.getElementById("page-sub").textContent = STATION_NAMES[STATION] || STATION;
-    document.getElementById("page-title").textContent = STATION + " \u00b7 Model Tracker";
-    renderStationPicker();
-  }).catch(function(){ buildStationButtons(); });
-}
-
-// Build initial buttons from defaults while loadStationPool() is in flight
 (function(){
   var container = document.getElementById("station-btns");
-  if(!container) return;
   STATION_LIST.forEach(function(s){
     var btn = document.createElement("button");
     btn.id = "btn-"+s;
@@ -1542,11 +1164,15 @@ function loadStationPool(){
 })();
 
 function updateStationButtons(){
-  buildStationButtons();
+  STATION_LIST.forEach(function(s){
+    var btn = document.getElementById("btn-"+s);
+    if(!btn) return;
+    btn.className = "stn-btn " + (s === STATION ? "active" : "inactive");
+  });
 }
 
 function clearDisplay(){
-  ["h-obs","h-wh","h-con","h-tmr","h-nowcast","s-obs","s-wh","s-con","s-tmr"].forEach(function(id){
+  ["h-obs","h-wh","h-con","h-tmr","s-obs","s-wh","s-con","s-tmr"].forEach(function(id){
     var el = document.getElementById(id); if(el) el.textContent="--";
   });
   ["h-obs-t","s-obs-t"].forEach(function(id){
@@ -1812,24 +1438,6 @@ function render(data){
     document.getElementById("h-tmr").textContent=tmrCon+"F";
     document.getElementById("s-tmr").textContent=tmrCon+"F";
   }
-
-  // Solar-adjusted nowcast high
-  var nc = data.nowcast;
-  var ncSc = document.getElementById("nowcast-sc");
-  if(nc && nc.nowcast != null){
-    document.getElementById("h-nowcast").textContent = nc.nowcast + "F";
-    document.getElementById("h-nowcast").style.color = nc.suppressed ? "var(--red)" : "var(--orange)";
-    document.getElementById("h-nowcast-note").textContent = nc.note;
-    document.getElementById("s-nowcast").textContent = nc.nowcast + "F";
-    document.getElementById("s-nowcast").style.color = nc.suppressed ? "var(--red)" : "var(--orange)";
-    document.getElementById("s-nowcast-note").textContent =
-      nc.solar_noon_obs + "F + " + nc.boost + "F · " + nc.note;
-    if(ncSc) ncSc.style.display = "";
-  } else {
-    document.getElementById("h-nowcast").textContent = "--";
-    document.getElementById("h-nowcast-note").textContent = "awaiting solar noon";
-    if(ncSc) ncSc.style.display = "none";
-  }
   document.getElementById("s-mods").textContent = rows.filter(function(r){ return r.raw_high!=null; }).length+"/"+rows.length;
 
   document.getElementById("main-tbody").innerHTML = rows.map(function(r,i){
@@ -1954,57 +1562,6 @@ function render(data){
     consPaceCard.style.display = "none";
   }
 
-  // Conditions card
-  var metar = data.metar;
-  var conds = data.conditions_consensus || {};
-  var condCard = document.getElementById("conditions-card");
-  if(metar || Object.keys(conds).length){
-    condCard.style.display = "block";
-    if(metar){
-      document.getElementById("metar-time").textContent =
-        metar.obs_time_utc ? metar.obs_time_utc.slice(11,16)+"Z" : "--";
-      document.getElementById("metar-sky").textContent = metar.sky_label || metar.sky_cover || "--";
-      var layers = (metar.sky_layers||[]).join(" ") || "--";
-      var ceilStr = metar.ceiling_ft
-        ? "ceiling " + metar.ceiling_ft.toLocaleString() + "ft"
-        : (["SKC","CLR","CAVOK","FEW","SCT"].indexOf(metar.sky_cover||"") >= 0 ? "no ceiling" : "--");
-      document.getElementById("metar-ceil").textContent = layers + " · " + ceilStr;
-      var mw = "--";
-      if(metar.wind_speed_mph != null){
-        mw = (metar.wind_dir_card ? metar.wind_dir_card+" " : "") + metar.wind_speed_mph + "mph";
-      }
-      document.getElementById("metar-wind").textContent = mw;
-      document.getElementById("metar-gust").textContent =
-        metar.wind_gust_mph ? "gust " + metar.wind_gust_mph + "mph" : "no gusts reported";
-      document.getElementById("metar-vis").textContent =
-        metar.visibility_sm != null ? metar.visibility_sm + " SM" : "--";
-    }
-    if(conds.wind_speed_mph != null){
-      document.getElementById("cond-wind").textContent = conds.wind_speed_mph.toFixed(1) + "mph";
-      document.getElementById("cond-wind-dir").textContent =
-        conds.wind_dir_card ? "from " + conds.wind_dir_card + " (" + Math.round(conds.wind_dir_deg||0) + "°)" : "--";
-    }
-    if(conds.wind_gust_mph != null)
-      document.getElementById("cond-gust").textContent = conds.wind_gust_mph.toFixed(1) + "mph";
-    if(conds.cloud_cover != null){
-      document.getElementById("cond-cloud").textContent = Math.round(conds.cloud_cover) + "%";
-      document.getElementById("cond-cloud").style.color =
-        conds.cloud_cover < 25 ? "var(--yellow)" : conds.cloud_cover < 60 ? "var(--blue)" : "var(--dim)";
-    }
-    if(conds.dew_point_f != null){
-      document.getElementById("cond-dew").textContent = conds.dew_point_f.toFixed(1) + "F";
-      document.getElementById("cond-humid").textContent =
-        conds.humidity_pct != null ? Math.round(conds.humidity_pct) + "% humidity" : "--";
-    }
-    if(conds.precip_in != null){
-      var precip = conds.precip_in;
-      document.getElementById("cond-precip").textContent = precip > 0 ? precip.toFixed(2) + '"' : "None";
-      document.getElementById("cond-precip").style.color = precip > 0.1 ? "var(--blue)" : "var(--dim)";
-    }
-  } else {
-    condCard.style.display = "none";
-  }
-
   var avgPace = data.today_avg_pace || {};
   var avgModels = Object.keys(avgPace);
   var todaySnaps = data.today_snapshot_count || 0;
@@ -2072,65 +1629,10 @@ function startCountdown(){
   },1000);
 }
 
-// --- Station picker ---
-var _selectedStations = STATION_LIST.slice();
-
-function renderStationPicker(){
-  var grid = document.getElementById("station-picker-grid");
-  if(!grid) return;
-  var allCodes = Object.keys(STATION_POOL_DATA).length ? Object.keys(STATION_POOL_DATA)
-    : ["KDCA","KOKC","KPHL","KBOS","KDEN","KHOU","KLAS","KMDW","KMSP","KSAT"];
-  grid.innerHTML = allCodes.map(function(code){
-    var active = _selectedStations.indexOf(code) >= 0;
-    return '<button onclick="togglePoolStation(\''+code+'\')" id="pool-btn-'+code+'" '
-      +'style="background:'+(active?"#1e40af":"none")+';border:1px solid '+(active?"#3b82f6":"#334155")+';'
-      +'color:'+(active?"#93c5fd":"#64748b")+';border-radius:4px;padding:6px 14px;font-size:11px;'
-      +'cursor:pointer;font-family:inherit;letter-spacing:1px">'+code+'</button>';
-  }).join("");
-}
-
-function togglePoolStation(code){
-  var idx = _selectedStations.indexOf(code);
-  if(idx >= 0){
-    if(_selectedStations.length > 1) _selectedStations.splice(idx, 1);
-  } else {
-    if(_selectedStations.length < 3) _selectedStations.push(code);
-  }
-  renderStationPicker();
-  var status = document.getElementById("station-save-status");
-  if(status) status.textContent = _selectedStations.length === 3 ? "" : "Select " + (3 - _selectedStations.length) + " more";
-}
-
-function saveActiveStations(){
-  var status = document.getElementById("station-save-status");
-  if(_selectedStations.length !== 3){
-    status.style.color = "var(--red)";
-    status.textContent = "Select exactly 3 stations.";
-    return;
-  }
-  fetch("/api/set_stations",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({stations:_selectedStations})})
-    .then(function(r){ return r.json(); })
-    .then(function(data){
-      if(data.ok){
-        STATION_LIST = data.active;
-        status.style.color = "var(--green)";
-        status.textContent = "Saved: " + data.active.join(", ");
-        buildStationButtons();
-        if(data.active.indexOf(STATION) < 0){
-          switchStation(data.active[0]);
-        }
-      } else {
-        status.style.color = "var(--red)";
-        status.textContent = data.error || "Error saving.";
-      }
-    });
-}
-
 document.getElementById("page-title").textContent = STATION + " \u00b7 Model Tracker";
 document.getElementById("page-sub").textContent = STATION_NAMES[STATION] || STATION;
 
 buildForms(); buildDefaultForm(); renderPreview(); poll(); startCountdown(); setInterval(poll,300000);
-loadStationPool();  // fetch active stations + update header buttons + render picker
 
 document.addEventListener("visibilitychange", function(){
   if(document.visibilityState === "visible"){ poll(); }
@@ -2236,8 +1738,7 @@ def start_background():
     with _start_lock:
         if not _started:
             _started = True
-            load_active_stations()
-            for station in STATION_POOL:
+            for station in STATIONS:
                 load_accuracy(station)
             t = threading.Thread(target=background_loop, daemon=True, name="bgloop")
             t.start()
