@@ -1718,22 +1718,20 @@ var STATION_NAMES = {
   "KMSP": "Minneapolis-St. Paul International",
   "KSAT": "San Antonio International Airport",
 };
-// Safe localStorage wrapper — Safari iOS throws SecurityError on localStorage
-// when "Prevent Cross-Site Tracking" is enabled, killing the entire script.
-var _ls = (function(){
-  try { lsGet("__test__"); return localStorage; } catch(e){ return null; }
-})();
-function lsGet(k){ try{ return _ls ? _ls.getItem(k) : null; } catch(e){ return null; } }
-function lsSet(k,v){ try{ if(_ls) _ls.setItem(k,v); } catch(e){} }
-function lsRemove(k){ try{ if(_ls) _ls.removeItem(k); } catch(e){} }
-
-var STATION = lsGet("active_station") || "KOKC";
+var STATION = localStorage.getItem("active_station") || "KOKC";
 // Will be corrected after loadStationPool() if no longer active
 var MODELS = [];
 var accData = {};
 
+// --- BUG J2 FIX ---
+// Defensive load: a corrupt-but-"valid" localStorage value (e.g. the literal
+// string "null", or any JSON that doesn't parse to a plain object) used to
+// blow up here with an uncaught TypeError from Object.keys(null), which
+// silently aborted ALL remaining inline init code below (button wiring,
+// IIFEs, etc.) with no visible error. We now validate the parsed shape
+// before trusting it.
 function safeLoadAcc(station){
-  var raw = lsGet("acc_"+station);
+  var raw = localStorage.getItem("acc_"+station);
   if(!raw) return {};
   try {
     var parsed = JSON.parse(raw);
@@ -1774,7 +1772,7 @@ function loadStationPool(){
     // If saved station is no longer active, switch to first active
     if(STATION_LIST.indexOf(STATION) === -1){
       STATION = STATION_LIST[0];
-      lsSet("active_station", STATION);
+      localStorage.setItem("active_station", STATION);
       accData = safeLoadAcc(STATION);
       MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
     }
@@ -1790,7 +1788,8 @@ function loadStationPool(){
     // updated from the server response, sync the picker selection to match.
     _selectedStations = STATION_LIST.slice();
     renderStationPicker();
-  }).catch(function(){ buildStationButtons(); });
+    poll(); // start polling only after station pool is confirmed
+  }).catch(function(){ buildStationButtons(); poll(); }); // poll even if station pool fails
 }
 
 // Build initial buttons from defaults while loadStationPool() is in flight
@@ -1828,7 +1827,7 @@ function clearDisplay(){
 
 function switchStation(s){
   STATION = s;
-  lsSet("active_station", s);
+  localStorage.setItem("active_station", s);
   clearDisplay();
   accData = safeLoadAcc(s);
   MODELS = Object.keys(accData).filter(function(m){ return m !== "NWS"; });
@@ -1938,7 +1937,7 @@ function saveDefaults(){
       delete accData[m].runs["default"];
     }
   });
-  lsSet("acc_"+STATION, JSON.stringify(accData));
+  localStorage.setItem("acc_"+STATION, JSON.stringify(accData));
   fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)})
     .then(function(r){ return r.json(); })
     .then(function(){
@@ -1946,7 +1945,7 @@ function saveDefaults(){
       status.textContent = "Defaults saved at "+new Date().toLocaleTimeString();
       renderPreview();
     }).catch(function(e){
-      lsSet("acc_"+STATION, JSON.stringify(accData));
+      localStorage.setItem("acc_"+STATION, JSON.stringify(accData));
       status.style.color="var(--yellow)";
       status.textContent = "Saved locally (server: "+e.message+")";
       renderPreview();
@@ -1959,7 +1958,7 @@ function clearDefaults(){
   mods.forEach(function(m){
     if(accData[m] && accData[m].runs) delete accData[m].runs["default"];
   });
-  lsSet("acc_"+STATION, JSON.stringify(accData));
+  localStorage.setItem("acc_"+STATION, JSON.stringify(accData));
   fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)});
   buildDefaultForm();
   document.getElementById("default-status").textContent = "Defaults cleared";
@@ -1988,8 +1987,8 @@ function loadFromJSON(){
     });
     accData = parsed;
     MODELS = keys.filter(function(m){ return m !== "NWS"; });
-    lsSet("acc_"+STATION, JSON.stringify(parsed));
-    lsSet("acc_"+STATION+"_time", new Date().toLocaleString());
+    localStorage.setItem("acc_"+STATION, JSON.stringify(parsed));
+    localStorage.setItem("acc_"+STATION+"_time", new Date().toLocaleString());
     fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(parsed)})
       .then(function(r){
         if(!r.ok) throw new Error("HTTP "+r.status);
@@ -2031,7 +2030,7 @@ function saveAccuracy(){
     }
   });
   accData = data;
-  lsSet("acc_"+STATION, JSON.stringify(data));
+  localStorage.setItem("acc_"+STATION, JSON.stringify(data));
   fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)})
     .then(function(){ document.getElementById("save-status").textContent="Saved "+new Date().toLocaleTimeString(); });
 }
@@ -2039,7 +2038,7 @@ function saveAccuracy(){
 function clearAccuracy(){
   if(!confirm("Clear all accuracy data?")) return;
   accData = {}; MODELS = [];
-  lsRemove("acc_"+STATION); lsRemove("acc_"+STATION+"_time");
+  localStorage.removeItem("acc_"+STATION); localStorage.removeItem("acc_"+STATION+"_time");
   fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})});
   buildForms(); buildDefaultForm(); renderPreview();
   document.getElementById("save-status").textContent="Cleared";
@@ -2052,7 +2051,7 @@ function renderPreview(){
   document.getElementById("acc-loaded").style.display = hasAny ? "inline" : "none";
   if(!hasAny){ el.style.display="none"; return; }
   el.style.display="block";
-  var t = lsGet("acc_"+STATION+"_time");
+  var t = localStorage.getItem("acc_"+STATION+"_time");
   if(t) document.getElementById("acc-loaded-time").textContent="Loaded: "+t;
   var mods = Object.keys(accData);
   document.getElementById("prev-tbody").innerHTML = mods.map(function(m,i){
@@ -2445,13 +2444,13 @@ function saveActiveStations(){
 
 document.getElementById("page-title").textContent = STATION + " \u00b7 Model Tracker";
 document.getElementById("page-sub").textContent = STATION_NAMES[STATION] || STATION;
-buildForms(); buildDefaultForm(); renderPreview(); poll(); startCountdown();
-loadStationPool(); // fetch active stations + update header buttons + render picker
+buildForms(); buildDefaultForm(); renderPreview(); startCountdown();
+loadStationPool(); // fetches /api/station_pool, then calls poll() on completion // fetch active stations + update header buttons + render picker
 
 document.addEventListener("visibilitychange", function(){
-  if(document.visibilityState === "visible"){ poll(); }
+  if(document.visibilityState === "visible"){ setTimeout(poll, 1000); }
 });
-window.addEventListener("focus", function(){ poll(); });
+window.addEventListener("focus", function(){ setTimeout(poll, 1000); });
 
 var _snapData = {};
 function loadSnapshots(){
