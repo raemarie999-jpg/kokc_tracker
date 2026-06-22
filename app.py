@@ -2315,16 +2315,16 @@ function render(data){
 }
 
 function poll(){
-  // BUG FIX: removed fire-and-forget POST /api/accuracy that ran on every poll.
-  // That accuracy data never changes between explicit user saves, so resending
-  // it constantly was pure waste. Worse: in single-threaded Werkzeug the POST
-  // and the state GET arrived simultaneously; Werkzeug served the POST first,
-  // and burst-firing (focus + visibilitychange + initial load at once) queued
-  // several POSTs ahead of each GET. If save_json_file had any latency those
-  // POSTs occupied all 6 Chrome per-origin connection slots and the state GET
-  // never got served — UI frozen, zero errors in the Flask log.
-  // Accuracy is now only POSTed when the user explicitly saves (saveAccuracy /
-  // saveDefaults / loadFromJSON / clearAccuracy) — the correct set of sites.
+  // BUG FIX: removed fire-and-forget POST /api/accuracy that fired on every
+  // poll. That accuracy data never changes between explicit user saves, so
+  // resending it every 60s was pure waste. Worse: in single-threaded Werkzeug
+  // the POST and the state GET arrived simultaneously; Werkzeug served the POST
+  // first, and burst-firing (focus + visibilitychange + initial load at once)
+  // queued several POSTs ahead of each GET. If save_json_file had any latency
+  // those POSTs occupied all 6 Chrome per-origin connection slots and the state
+  // GET never got served - UI frozen, zero errors in the Flask log.
+  // Accuracy is now only POSTed when the user explicitly saves (saveAccuracy,
+  // saveDefaults, loadFromJSON, clearAccuracy) - the correct set of call sites.
   fetch("/api/state?station="+STATION).then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error("Poll error",e); });
 }
 
