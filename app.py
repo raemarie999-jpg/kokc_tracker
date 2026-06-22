@@ -1402,7 +1402,7 @@ HTML = """<!DOCTYPE html>
   --orange:#fb923c;
 }
 body{background:var(--bg);color:var(--text);font-family:'IBM Plex Mono',monospace;font-size:13px}
-.topbar{position:sticky;top:0;z-index:20;background:var(--bg3)}
+.topbar{background:var(--bg3)}
 header{background:var(--bg3);border-bottom:1px solid var(--border);padding:14px 20px;
   display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px}
 h1{font-size:18px;color:#e8f0f8;letter-spacing:-.5px}
@@ -1412,7 +1412,7 @@ h1{font-size:18px;color:#e8f0f8;letter-spacing:-.5px}
 .stat-pill .lbl{font-size:9px;color:var(--dim);letter-spacing:2px;text-transform:uppercase}
 .stat-pill .val{font-size:22px;font-weight:700;line-height:1.1}
 .stat-pill .sub2{font-size:9px;color:var(--dimmer)}
-nav{display:flex;gap:2px;background:var(--bg3);border-bottom:1px solid var(--border);padding:0 12px;overflow-x:auto}
+nav{display:flex;gap:2px;background:var(--bg3);border-bottom:1px solid var(--border);padding:0 12px;overflow-x:auto;position:sticky;top:0;z-index:20}
 nav button{background:none;border:none;border-bottom:2px solid transparent;color:var(--dim);
   padding:10px 16px;font-size:11px;letter-spacing:1.5px;text-transform:uppercase;
   cursor:pointer;font-family:inherit;transition:color .15s;white-space:nowrap}
