@@ -240,14 +240,24 @@ def add_log(msg, level="info", station="KOKC"):
 
 
 def _throttle():
-    """Enforce minimum interval between API calls (global, across all stations)."""
+    """Enforce minimum interval between API calls (global, across all stations).
+
+    BUG FIX: the original code held _api_lock across the entire sleep(),
+    meaning the lock was monopolised for up to 2.5 s × 54 calls = 135 s per
+    fetch cycle. Nothing in the request-handling path contends for _api_lock
+    directly, but holding it across a blocking sleep is still wrong: any
+    future code path that acquires it would deadlock for the full sleep
+    duration. Fix: compute the required wait inside the lock (atomic read of
+    _last_request_time + update), then sleep outside the lock.
+    """
     global _last_request_time
     with _api_lock:
         now = time.monotonic()
         gap = now - _last_request_time
-        if gap < MIN_REQUEST_INTERVAL:
-            time.sleep(MIN_REQUEST_INTERVAL - gap)
-        _last_request_time = time.monotonic()
+        wait = MIN_REQUEST_INTERVAL - gap if gap < MIN_REQUEST_INTERVAL else 0
+        _last_request_time = time.monotonic() + wait  # reserve the slot now
+    if wait > 0:
+        time.sleep(wait)
 
 
 def wethr_get(path, retries=3):
@@ -2305,10 +2315,16 @@ function render(data){
 }
 
 function poll(){
-  accData = safeLoadAcc(STATION);
-  if(Object.keys(accData).length){
-    fetch("/api/accuracy?station="+STATION,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(accData)});
-  }
+  // BUG FIX: removed fire-and-forget POST /api/accuracy that ran on every poll.
+  // That accuracy data never changes between explicit user saves, so resending
+  // it constantly was pure waste. Worse: in single-threaded Werkzeug the POST
+  // and the state GET arrived simultaneously; Werkzeug served the POST first,
+  // and burst-firing (focus + visibilitychange + initial load at once) queued
+  // several POSTs ahead of each GET. If save_json_file had any latency those
+  // POSTs occupied all 6 Chrome per-origin connection slots and the state GET
+  // never got served — UI frozen, zero errors in the Flask log.
+  // Accuracy is now only POSTed when the user explicitly saves (saveAccuracy /
+  // saveDefaults / loadFromJSON / clearAccuracy) — the correct set of sites.
   fetch("/api/state?station="+STATION).then(function(r){ return r.json(); }).then(render).catch(function(e){ console.error("Poll error",e); });
 }
 
@@ -2548,4 +2564,4 @@ with app.app_context():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
