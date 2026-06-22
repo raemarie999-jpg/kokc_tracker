@@ -1788,8 +1788,7 @@ function loadStationPool(){
     // updated from the server response, sync the picker selection to match.
     _selectedStations = STATION_LIST.slice();
     renderStationPicker();
-    poll(); // start polling only after station pool is confirmed
-  }).catch(function(){ buildStationButtons(); poll(); }); // poll even if station pool fails
+  }).catch(function(){ buildStationButtons(); });
 }
 
 // Build initial buttons from defaults while loadStationPool() is in flight
@@ -2444,13 +2443,13 @@ function saveActiveStations(){
 
 document.getElementById("page-title").textContent = STATION + " \u00b7 Model Tracker";
 document.getElementById("page-sub").textContent = STATION_NAMES[STATION] || STATION;
-buildForms(); buildDefaultForm(); renderPreview(); startCountdown();
-loadStationPool(); // fetches /api/station_pool, then calls poll() on completion // fetch active stations + update header buttons + render picker
+buildForms(); buildDefaultForm(); renderPreview(); poll(); startCountdown();
+loadStationPool(); // fetch active stations + update header buttons + render picker
 
 document.addEventListener("visibilitychange", function(){
-  if(document.visibilityState === "visible"){ setTimeout(poll, 1000); }
+  if(document.visibilityState === "visible"){ poll(); }
 });
-window.addEventListener("focus", function(){ setTimeout(poll, 1000); });
+window.addEventListener("focus", function(){ poll(); });
 
 var _snapData = {};
 function loadSnapshots(){
@@ -2547,7 +2546,7 @@ def start_background():
         if not _started:
             _started = True
             load_active_stations()
-            for station in STATION_POOL:
+            for station in get_active_stations():
                 load_accuracy(station)
             # Route through the same cross-process ownership check used by the
             # watchdog (see BUG P1 cross-process fix above) — only the worker
