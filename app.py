@@ -1,4 +1,4 @@
-import os, json, time, threading, random
+import os, json, time, threading, random, math
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, render_template_string
 import requests
@@ -109,6 +109,23 @@ STATION_TZ_OFFSET = {
     "KDCA": -5,
 }
 
+# --- Nowcast / conditions constants ---
+# Sky cover boost tiers (oktas -> F bonus): applied to solar-adjusted nowcast
+_SKY_BOOST = [
+    (0, 2,  3.0),   # CLR / FEW  (0-2 oktas): full solar boost
+    (3, 4,  1.5),   # SCT        (3-4 oktas): partial boost
+    (5, 6,  0.5),   # BKN        (5-6 oktas): small boost
+    (7, 8,  0.0),   # OVC/OVX    (7-8 oktas): no boost
+]
+# Wind directions that suppress solar boost (northerly quadrant)
+_NORTHERLY = {"N", "NNE", "NNW", "NE", "NW"}
+# Station longitudes for solar noon calculation
+STATION_LON = {
+    "KOKC": -97.6007,
+    "KPHL": -75.2408,
+    "KDCA": -77.0377,
+}
+
 ALL_KNOWN_MODELS = [
     "ARPEGE","HRRR","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NAM-MOS","NBM",
     "NAM4KM","GFS","ICON","GFS-MOS","ECMWF-HRES","GEFS","JMA","RDPS","SREF"
@@ -129,6 +146,9 @@ def make_state():
         "log": [],
         "today_avg_pace": {},
         "consensus_snapshots": [],
+        "metar": None,          # raw METAR dict from aviationweather.gov
+        "solar_noon_obs": None, # obs temp recorded near solar noon (float or None)
+        "solar_noon_dt": None,  # UTC datetime string when solar noon obs was recorded
     }
 
 states = {s: make_state() for s in STATIONS}
@@ -281,6 +301,149 @@ def get_run_data(acc_model, run_key):
     # 3. Nothing run-specific found
     return {}, "overall"
 
+def _safe_float(v):
+    """Convert v to float, returning None for None/NaN/Inf (safe for JSON serialization)."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    except (TypeError, ValueError):
+        return None
+
+def deg_to_cardinal(deg):
+    """Convert wind degrees to 16-point cardinal string, e.g. 337 -> 'NNW'."""
+    try:
+        d = float(deg) % 360
+    except (TypeError, ValueError):
+        return None
+    dirs = ["N","NNE","NE","ENE","E","ESE","SE","SSE",
+            "S","SSW","SW","WSW","W","WNW","NW","NNW"]
+    return dirs[int((d + 11.25) / 22.5) % 16]
+
+def fetch_metar(station):
+    """
+    Fetch the latest METAR for station from aviationweather.gov.
+    Uses plain requests.get — NOT wethr_get — so it never touches the daily cap.
+    Returns a dict with keys: raw, temp_c, wind_dir, wind_speed_kt, sky_oktas, flight_category.
+    Returns None on any failure.
+    """
+    try:
+        url = f"https://aviationweather.gov/api/data/metar?ids={station}&format=json&taf=false"
+        r = requests.get(url, timeout=8)
+        r.raise_for_status()
+        data = r.json()
+        if not data or not isinstance(data, list):
+            return None
+        m = data[0]
+        # Sky cover: take the highest BKN/OVC/OVX layer, else highest SCT/FEW
+        sky_oktas = None
+        sky_layers = m.get("clouds") or []
+        cover_map = {"CLR": 0, "SKC": 0, "FEW": 1, "SCT": 3, "BKN": 5, "OVC": 7, "OVX": 8}
+        max_cover = -1
+        for layer in sky_layers:
+            cov = layer.get("cover", "")
+            val = cover_map.get(cov, -1)
+            if val > max_cover:
+                max_cover = val
+        if max_cover >= 0:
+            sky_oktas = max_cover
+        wind_dir_deg = m.get("wdir")
+        wind_card = deg_to_cardinal(wind_dir_deg)
+        return {
+            "raw": m.get("rawOb", ""),
+            "temp_c": _safe_float(m.get("temp")),
+            "wind_dir": wind_card,
+            "wind_dir_deg": _safe_float(wind_dir_deg),
+            "wind_speed_kt": _safe_float(m.get("wspd")),
+            "sky_oktas": sky_oktas,
+            "flight_category": m.get("fltcat", ""),
+            "obs_time": m.get("obsTime", ""),
+        }
+    except Exception as e:
+        return None
+
+def solar_noon_utc(station, date_utc=None):
+    """
+    Compute approximate solar noon in UTC for a station on the given date.
+    Uses pure Python — no external deps. Accurate to ~1 minute for our purposes.
+    Returns a datetime object (UTC).
+    """
+    if date_utc is None:
+        date_utc = datetime.utcnow().date()
+    lon = STATION_LON.get(station, -90.0)
+    # Day of year
+    import datetime as _dt
+    doy = date_utc.timetuple().tm_yday
+    # Equation of time (minutes) — Spencer's approximation
+    B = math.radians((360 / 365) * (doy - 81))
+    eot = 9.87 * math.sin(2 * B) - 7.53 * math.cos(B) - 1.5 * math.sin(B)  # minutes
+    # Solar noon UTC = 12:00 local solar time -> UTC
+    lon_correction_min = lon * 4  # 4 min per degree west = negative
+    solar_noon_local_min = 720  # 12:00 in minutes
+    solar_noon_utc_min = solar_noon_local_min - lon_correction_min - eot
+    h = int(solar_noon_utc_min // 60) % 24
+    mins = int(solar_noon_utc_min % 60)
+    return datetime(date_utc.year, date_utc.month, date_utc.day, h, mins, 0)
+
+def compute_nowcast(station, st):
+    """
+    Compute a solar-adjusted nowcast high from the current obs temp.
+    Logic:
+      - Find hours remaining to solar noon
+      - Apply sky cover boost (tiered) if time is before solar noon
+      - Suppress boost if northerly wind
+      - Return None if obs is missing or solar noon has passed by > 2 hours
+    Returns a dict: {nowcast, solar_noon_utc, hours_to_noon, sky_boost, suppressed}
+    or None on failure.
+    """
+    try:
+        obs = st.get("obs") or {}
+        obs_temp = _safe_float(obs.get("temperature_display"))
+        if obs_temp is None:
+            return None
+        metar = st.get("metar") or {}
+        sky_oktas = metar.get("sky_oktas")
+        wind_dir = metar.get("wind_dir")
+        now_utc = datetime.utcnow()
+        noon_utc = solar_noon_utc(station, now_utc.date())
+        hours_to_noon = (noon_utc - now_utc).total_seconds() / 3600.0
+        # Don't nowcast if solar noon has passed by more than 2 hours
+        if hours_to_noon < -2.0:
+            return None
+        # Determine sky boost
+        boost = 0.0
+        if sky_oktas is not None:
+            for lo, hi, b in _SKY_BOOST:
+                if lo <= sky_oktas <= hi:
+                    boost = b
+                    break
+        else:
+            boost = 1.0  # unknown sky: use modest default
+        # Suppress boost for northerly winds
+        suppressed = False
+        if wind_dir in _NORTHERLY and boost > 0:
+            boost = 0.0
+            suppressed = True
+        # Scale boost by time remaining (more boost if further from noon)
+        time_factor = max(0.0, min(1.0, hours_to_noon / 4.0))
+        scaled_boost = round(boost * time_factor, 1)
+        nowcast = round(obs_temp + scaled_boost, 1)
+        return {
+            "nowcast": nowcast,
+            "obs_temp": obs_temp,
+            "solar_noon_utc": noon_utc.strftime("%H:%MZ"),
+            "hours_to_noon": round(hours_to_noon, 2),
+            "sky_boost": scaled_boost,
+            "suppressed": suppressed,
+            "sky_oktas": sky_oktas,
+            "wind_dir": wind_dir,
+        }
+    except Exception:
+        return None
+
 def fetch_all(station="KOKC"):
     st = get_state(station)
     if not API_KEY:
@@ -316,6 +479,20 @@ def fetch_all(station="KOKC"):
     except Exception as e:
         errors.append(f"Obs: {e}")
         add_log(f"Obs error: {e}", "err", station)
+
+    # Solar noon obs recording (read-only, no API call, cannot crash fetch_all)
+    try:
+        noon_utc = solar_noon_utc(station)
+        now_utc = datetime.utcnow()
+        diff_min = abs((now_utc - noon_utc).total_seconds()) / 60.0
+        if diff_min <= 15 and st.get("obs"):
+            solar_temp = _safe_float((st["obs"] or {}).get("temperature_display"))
+            if solar_temp is not None:
+                st["solar_noon_obs"] = solar_temp
+                st["solar_noon_dt"] = now_utc.strftime("%Y-%m-%dT%H:%MZ")
+                add_log(f"Solar noon obs recorded: {solar_temp}F at {st['solar_noon_dt']}", "info", station)
+    except Exception as e:
+        add_log(f"Solar noon obs error (non-fatal): {e}", "warn", station)
 
     # Wethr high
     try:
@@ -377,6 +554,9 @@ def fetch_all(station="KOKC"):
                     "tmr_high": tmr_temp,
                     "tmr_low": tmr_low,
                     "tmr_low_time": tmr_low_time,
+                    # Conditions fields extracted from closest forecast entry
+                    "conditions": _safe_float(closest.get("weather_code") or closest.get("condition_code")),
+                    "cloud_cover": _safe_float(closest.get("cloud_cover") or closest.get("total_cloud_cover")),
                 }
                 if raw_temp is None:
                     add_log(f"{model}: WARNING raw_temp=None — check sample keys above. entry keys={list(max_entry.keys())}", "warn", station)
@@ -407,6 +587,17 @@ def fetch_all(station="KOKC"):
             save_consensus_snapshot(station)
     except Exception as e:
         add_log(f"Consensus snapshot error: {e}", "warn", station)
+
+    # METAR fetch — uses aviationweather.gov (free), NOT wethr_get, cannot touch daily cap
+    try:
+        metar = fetch_metar(station)
+        if metar:
+            st["metar"] = metar
+            add_log(f"METAR: sky={metar.get('sky_oktas')} oktas wind={metar.get('wind_dir')} cat={metar.get('flight_category')}", "info", station)
+        else:
+            add_log("METAR: no data returned (non-fatal)", "warn", station)
+    except Exception as e:
+        add_log(f"METAR fetch error (non-fatal): {e}", "warn", station)
 
 
 _memory_snapshots = {}
@@ -655,6 +846,8 @@ def api_state():
             "tmr_low": tmr_low, "tmr_low_adj": tmr_low_adj, "tmr_low_time": tmr_low_time,
             "mae": display_mae, "rmse": a.get("rmse"),
             "runs": a.get("runs", {}),
+            "conditions": _safe_float(fcst.get("conditions")),
+            "cloud_cover": _safe_float(fcst.get("cloud_cover")),
         })
 
     w_sum, w_total = 0, 0
@@ -682,6 +875,23 @@ def api_state():
                 w = 1/mae; tw_sum += tadj*w; tw_total += w
         except: pass
     tmr_consensus = round(tw_sum/tw_total, 1) if tw_total > 0 else None
+
+    # Conditions consensus + nowcast — isolated try/except; failure returns safe defaults
+    conditions_data = {}
+    nowcast_data = None
+    try:
+        cloud_vals = [r["cloud_cover"] for r in rows if r.get("cloud_cover") is not None]
+        conditions_data = {
+            "metar": st.get("metar"),
+            "solar_noon_obs": _safe_float(st.get("solar_noon_obs")),
+            "solar_noon_dt": st.get("solar_noon_dt"),
+            "model_cloud_cover_avg": round(sum(cloud_vals) / len(cloud_vals), 1) if cloud_vals else None,
+        }
+        nowcast_data = compute_nowcast(station, st)
+    except Exception:
+        conditions_data = {}
+        nowcast_data = None
+
     return jsonify({
         "station": station, "obs": st["obs"], "wethr_high": st["wethr_high"],
         "rows": rows, "consensus": consensus,
@@ -693,6 +903,9 @@ def api_state():
         "today_avg_pace": st["today_avg_pace"],
         "today_snapshot_count": len(load_json_file(f"{DATA_DIR}/pacing_{station}.json", {}).get(station_local_now(station).strftime("%Y-%m-%d"), [])),
         "prev_days": _get_prev_days(3, station),
+        "conditions": conditions_data,
+        "nowcast": nowcast_data,
+        "solar_noon_obs": _safe_float(st.get("solar_noon_obs")),
     })
 
 @app.route("/api/history")
@@ -911,6 +1124,12 @@ th.default-col{color:var(--orange) !important}
       <div class="sub2">MAE-weighted</div>
     </div>
     <div class="sp"></div>
+    <div class="stat-pill" id="h-nowcast-pill" style="display:none">
+      <div class="lbl">Nowcast High</div>
+      <div class="val" id="h-nowcast" style="color:var(--orange)">--</div>
+      <div class="sub2" id="h-nowcast-sub">solar adj</div>
+    </div>
+    <div class="sp"></div>
     <div style="display:flex;gap:6px;align-items:center" id="station-btns"></div>
     <div class="sp"></div>
     <div style="text-align:right">
@@ -942,6 +1161,7 @@ th.default-col{color:var(--orange) !important}
     <div class="sc"><div class="lbl">Consensus High</div><div class="v" id="s-con" style="color:var(--blue)">--</div><div class="s">MAE-weighted adj</div></div>
     <div class="sc"><div class="lbl">Models Live</div><div class="v" id="s-mods" style="color:var(--purple)">--</div><div class="s">forecast runs</div></div>
     <div class="sc"><div class="lbl">Tmr Consensus</div><div class="v" id="s-tmr" style="color:#a78bfa">--</div><div class="s">MAE-weighted adj</div></div>
+    <div class="sc" id="s-nowcast-sc" style="display:none"><div class="lbl">Nowcast High</div><div class="v" id="s-nowcast" style="color:var(--orange)">--</div><div class="s" id="s-nowcast-sub">solar adj</div></div>
   </div>
 
   <div class="card">
@@ -991,6 +1211,17 @@ th.default-col{color:var(--orange) !important}
   <div class="card" id="prev-days-card">
     <div class="ctitle">Previous 3 Days Average Pace</div>
     <div style="overflow-x:auto"><table><thead id="prev-days-thead"></thead><tbody id="prev-days-tbody"><tr><td style="color:var(--dim)">No history yet</td></tr></tbody></table></div>
+  </div>
+
+  <div class="card" id="conditions-card" style="display:none">
+    <div class="ctitle">Conditions &amp; Nowcast</div>
+    <div class="srow" style="margin-bottom:8px">
+      <div class="sc"><div class="lbl">Flight Cat</div><div class="v" id="cond-fltcat" style="font-size:16px">--</div><div class="s">METAR</div></div>
+      <div class="sc"><div class="lbl">Sky Cover</div><div class="v" id="cond-sky" style="font-size:16px">--</div><div class="s">oktas (METAR)</div></div>
+      <div class="sc"><div class="lbl">Wind</div><div class="v" id="cond-wind" style="font-size:16px">--</div><div class="s" id="cond-wind-kt">-- kt</div></div>
+      <div class="sc"><div class="lbl">Solar Noon Obs</div><div class="v" id="cond-noon-obs" style="color:var(--yellow);font-size:16px">--</div><div class="s" id="cond-noon-dt">--</div></div>
+    </div>
+    <div style="font-size:10px;color:var(--dimmer);margin-top:4px" id="cond-metar-raw"></div>
   </div>
 
   <div class="card" id="nws-card" style="display:none">
@@ -1599,6 +1830,57 @@ function render(data){
 
   document.getElementById("sdot").className = "dot "+(data.errors&&data.errors.length?"dot-yellow":"dot-green");
   document.getElementById("stxt").textContent = data.last_updated?"Updated "+data.last_updated.slice(11,16):"Live";
+
+  // --- Nowcast rendering (appended after existing render code) ---
+  try {
+    var nc = data.nowcast;
+    var ncPill = document.getElementById("h-nowcast-pill");
+    var ncSc   = document.getElementById("s-nowcast-sc");
+    if(nc && nc.nowcast != null){
+      var ncVal = nc.nowcast + "F";
+      var ncSub = "+" + nc.sky_boost + "F solar" + (nc.suppressed ? " (wind suppressed)" : "");
+      var elHN = document.getElementById("h-nowcast"); if(elHN) elHN.textContent = ncVal;
+      var elHS = document.getElementById("h-nowcast-sub"); if(elHS) elHS.textContent = ncSub;
+      var elSN = document.getElementById("s-nowcast"); if(elSN) elSN.textContent = ncVal;
+      var elSS = document.getElementById("s-nowcast-sub"); if(elSS) elSS.textContent = ncSub;
+      if(ncPill) ncPill.style.display = "block";
+      if(ncSc)   ncSc.style.display   = "block";
+    } else {
+      if(ncPill) ncPill.style.display = "none";
+      if(ncSc)   ncSc.style.display   = "none";
+    }
+  } catch(e){ console.error("Nowcast render error", e); }
+
+  // --- Conditions card rendering (appended after existing render code) ---
+  try {
+    var cond = data.conditions || {};
+    var metar = cond.metar || {};
+    var condCard = document.getElementById("conditions-card");
+    var hasMeta = metar && (metar.flight_category || metar.sky_oktas != null || metar.wind_dir);
+    if(hasMeta || cond.solar_noon_obs != null){
+      if(condCard) condCard.style.display = "block";
+      var elFlt = document.getElementById("cond-fltcat");
+      if(elFlt){
+        elFlt.textContent = metar.flight_category || "--";
+        var fltColors = {VFR:"var(--green)", MVFR:"var(--blue)", IFR:"var(--red)", LIFR:"var(--purple)"};
+        elFlt.style.color = fltColors[metar.flight_category] || "var(--text)";
+      }
+      var elSky = document.getElementById("cond-sky");
+      if(elSky) elSky.textContent = metar.sky_oktas != null ? metar.sky_oktas + " oktas" : "--";
+      var elWind = document.getElementById("cond-wind");
+      if(elWind) elWind.textContent = metar.wind_dir || "--";
+      var elKt = document.getElementById("cond-wind-kt");
+      if(elKt) elKt.textContent = metar.wind_speed_kt != null ? metar.wind_speed_kt + " kt" : "-- kt";
+      var elNoonObs = document.getElementById("cond-noon-obs");
+      if(elNoonObs) elNoonObs.textContent = cond.solar_noon_obs != null ? cond.solar_noon_obs + "F" : "--";
+      var elNoonDt = document.getElementById("cond-noon-dt");
+      if(elNoonDt) elNoonDt.textContent = cond.solar_noon_dt || "--";
+      var elRaw = document.getElementById("cond-metar-raw");
+      if(elRaw) elRaw.textContent = metar.raw || "";
+    } else {
+      if(condCard) condCard.style.display = "none";
+    }
+  } catch(e){ console.error("Conditions render error", e); }
 }
 
 function poll(){
