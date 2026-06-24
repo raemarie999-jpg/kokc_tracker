@@ -97,17 +97,34 @@ def save_json_file(path, data):
         add_log(f"Save error {path}: {e}", "err")
         return False
 
-STATIONS = ["KOKC", "KPHL", "KDCA"]
+STATIONS = ["KOKC", "KPHL", "KDCA", "KBOS", "KDEN", "KHOU", "KLAS", "KMDW", "KMSP", "KSAT"]
 STATION_NAMES = {
     "KOKC": "Oklahoma City Will Rogers World Airport",
     "KPHL": "Philadelphia International Airport",
     "KDCA": "Washington Reagan National Airport",
+    "KBOS": "Boston Logan International Airport",
+    "KDEN": "Denver International Airport",
+    "KHOU": "Houston William P. Hobby Airport",
+    "KLAS": "Las Vegas Harry Reid International Airport",
+    "KMDW": "Chicago Midway International Airport",
+    "KMSP": "Minneapolis-Saint Paul International Airport",
+    "KSAT": "San Antonio International Airport",
 }
 STATION_TZ_OFFSET = {
     "KOKC": -6,
     "KPHL": -5,
     "KDCA": -5,
+    "KBOS": -5,
+    "KDEN": -7,
+    "KHOU": -6,
+    "KLAS": -8,
+    "KMDW": -6,
+    "KMSP": -6,
+    "KSAT": -6,
 }
+# Only these stations are fetched automatically by the background loop.
+# All 10 are valid and can be fetched on demand via the NOW button.
+BACKGROUND_STATIONS = ["KOKC", "KPHL", "KDCA"]
 
 # --- Nowcast / conditions constants ---
 # Sky cover boost tiers (oktas -> F bonus): applied to solar-adjusted nowcast
@@ -124,6 +141,13 @@ STATION_LON = {
     "KOKC": -97.6007,
     "KPHL": -75.2408,
     "KDCA": -77.0377,
+    "KBOS": -71.0052,
+    "KDEN": -104.6737,
+    "KHOU": -95.2789,
+    "KLAS": -115.1523,
+    "KMDW": -87.7524,
+    "KMSP": -93.2218,
+    "KSAT": -98.4700,
 }
 
 ALL_KNOWN_MODELS = [
@@ -684,15 +708,13 @@ def build_snapshot_rows(station="KOKC"):
 
 def scheduled_fetch():
     """
-    Fetch each station sequentially with a generous gap between them.
-    Each station's model fetches are already serialized + throttled inside fetch_all.
+    Auto-fetch background stations only. All 10 stations are valid and fetchable
+    on demand via the NOW button; only BACKGROUND_STATIONS run automatically.
     """
-    for i, station in enumerate(STATIONS):
+    for i, station in enumerate(BACKGROUND_STATIONS):
         if i > 0:
-            # Wait long enough for the previous station's fetches to finish
-            # and for the API to not consider it a burst.
             gap = 10 + random.uniform(2, 5)
-            add_log(f"Waiting {gap:.0f}s before fetching next station", "info", STATIONS[i-1])
+            add_log(f"Waiting {gap:.0f}s before fetching next station", "info", BACKGROUND_STATIONS[i-1])
             time.sleep(gap)
         try:
             fetch_all(station)
@@ -1366,11 +1388,18 @@ th.default-col{color:var(--orange) !important}
 </main>
 
 <script>
-var STATION_LIST = ["KOKC","KPHL","KDCA"];
+var STATION_LIST = ["KOKC","KPHL","KDCA","KBOS","KDEN","KHOU","KLAS","KMDW","KMSP","KSAT"];
 var STATION_NAMES = {
   "KOKC": "Oklahoma City Will Rogers World Airport",
   "KPHL": "Philadelphia International Airport",
-  "KDCA": "Washington Reagan National Airport"
+  "KDCA": "Washington Reagan National Airport",
+  "KBOS": "Boston Logan International Airport",
+  "KDEN": "Denver International Airport",
+  "KHOU": "Houston William P. Hobby Airport",
+  "KLAS": "Las Vegas Harry Reid International Airport",
+  "KMDW": "Chicago Midway International Airport",
+  "KMSP": "Minneapolis-Saint Paul International Airport",
+  "KSAT": "San Antonio International Airport"
 };
 var STATION = localStorage.getItem("active_station") || "KOKC";
 if(STATION_LIST.indexOf(STATION) === -1) STATION = "KOKC";
