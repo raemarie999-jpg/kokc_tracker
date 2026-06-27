@@ -1035,6 +1035,7 @@ def manual_refresh():
         _last_manual_refresh[station] = now
     threading.Thread(target=fetch_all, args=(station,), daemon=True).start()
     return jsonify({"ok": True})
+
 @app.before_request
 def watchdog():
     for t in threading.enumerate():
@@ -1048,7 +1049,7 @@ def watchdog():
 def index():
     return render_template_string(HTML)
 
-HTML = """<!DOCTYPE html>
+HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -1282,6 +1283,16 @@ th.default-col{color:var(--orange) !important}
       has <em>no</em> run-specific entry &mdash; keeping it out of consensus rather than polluting it with uncalibrated data.
       <br><span style="color:var(--orange)">D</span> badge in the dashboard Correction column indicates the default is active.
     </p>
+    <div style="margin-bottom:14px;padding:10px;background:#1a1a2e;border:1px solid #334155;border-radius:6px">
+      <div style="font-size:10px;color:var(--orange);letter-spacing:1px;margin-bottom:6px">&#9657; PASTE FROM WETHR.NET</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:8px">Paste the accuracy table from wethr.net — all models auto-filled in one shot.</div>
+      <textarea id="paste-defaults-input" rows="6" style="width:100%;background:#0f0f1a;border:1px solid #334155;color:var(--text);border-radius:4px;padding:8px;font-size:11px;font-family:monospace;box-sizing:border-box;resize:vertical" placeholder="MODEL&#9;MAE&#9;CORRECTION&#9;RMSE&#9;DAYS&#10;NBM&#9;0.7°&#9;-0.5°F&#9;1.1°&#9;6&#10;HRRR&#9;1.1°&#9;+0.1°F&#9;1.5°&#9;6&#10;..."></textarea>
+      <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
+        <button class="btn btn-blue" onclick="parseAndFillDefaults()">Fill From Paste</button>
+        <button class="btn btn-blue" onclick="fillDefaultsFromLoaded()" style="margin-left:6px">Fill From Loaded Accuracy</button>
+        <span id="paste-status" style="font-size:10px;color:var(--dim)"></span>
+      </div>
+    </div>
     <div style="overflow-x:auto">
       <table>
         <thead>
@@ -1530,6 +1541,89 @@ function buildDefaultForm(){
       +'<td style="color:var(--dim);font-size:11px">'+namedRuns+'</td>'
       +'</tr>';
   }).join("");
+}
+
+function fillDefaultsFromLoaded(){
+  var status = document.getElementById("paste-status");
+  var filled = 0;
+  Object.keys(accData).forEach(function(model){
+    if(model === "NWS") return;
+    var runs = (accData[model] || {}).runs || {};
+    // Collect all non-default run entries and average their mae/correction
+    var maes = [], corrs = [];
+    Object.keys(runs).forEach(function(run){
+      if(run === "default") return;
+      var rd = runs[run];
+      var m = parseFloat(rd.mae); var c = parseFloat(rd.correction);
+      if(!isNaN(m)) maes.push(m);
+      if(!isNaN(c)) corrs.push(c);
+    });
+    if(maes.length === 0 && corrs.length === 0) return;
+    var avgMae = maes.length ? round1(maes.reduce(function(a,b){return a+b},0)/maes.length) : null;
+    var avgCorr = corrs.length ? round1(corrs.reduce(function(a,b){return a+b},0)/corrs.length) : null;
+    var maeEl = document.getElementById("def-mae-"+model);
+    var corrEl = document.getElementById("def-corr-"+model);
+    if(maeEl && avgMae !== null) maeEl.value = avgMae;
+    if(corrEl && avgCorr !== null) corrEl.value = avgCorr;
+    if(maeEl || corrEl) filled++;
+  });
+  status.style.color = filled > 0 ? "var(--green)" : "var(--red)";
+  status.textContent = filled + " models filled from loaded accuracy — hit Save Defaults to commit.";
+}
+
+function round1(v){ return Math.round(v*10)/10; }
+
+function parseAndFillDefaults(){
+  var raw = (document.getElementById("paste-defaults-input").value || "").trim();
+  var status = document.getElementById("paste-status");
+  if(!raw){ status.textContent = "Nothing to parse."; return; }
+
+  // Model name aliases — wethr sometimes uses different names than our internal keys
+  var aliases = {
+    "NBS-MOS": "NBS-MOS", "NBSMOS": "NBS-MOS",
+    "GFS-MOS": "GFS-MOS", "GFSMOS": "GFS-MOS",
+    "LAV-MOS": "LAV-MOS", "LAVMOS": "LAV-MOS",
+    "NAM-MOS": "NAM-MOS", "NAMMOS": "NAM-MOS",
+    "GEM-GDPS": "GEM-GDPS", "GEMGDPS": "GEM-GDPS",
+    "GEM-HRDPS": "GEM-HRDPS", "GEMHRDPS": "GEM-HRDPS",
+    "ECMWF-IFS": "ECMWF-IFS", "ECMWFIFS": "ECMWF-IFS",
+    "ECMWF-HRES": "ECMWF-HRES", "ECMWFHRES": "ECMWF-HRES",
+  };
+
+  var filled = 0, skipped = 0;
+  var lines = raw.split("\n");
+  lines.forEach(function(line){
+    line = line.trim();
+    if(!line || line.toLowerCase().startsWith("model")) return; // skip header
+    // Split on tabs or multiple spaces
+    var cols = line.split(/\t+|\s{2,}/);
+    if(cols.length < 3) return;
+    var rawModel = cols[0].trim().toUpperCase();
+    var model = aliases[rawModel] || rawModel;
+    // Parse MAE: strip °, spaces
+    var maeRaw = cols[1].replace(/[°\s]/g, "");
+    var mae = parseFloat(maeRaw);
+    // Parse correction: strip °F, spaces, keep sign
+    var corrRaw = cols[2].replace(/[°F\s]/g, "");
+    var corr = parseFloat(corrRaw);
+    if(isNaN(mae) || isNaN(corr)){ skipped++; return; }
+    // Find matching input fields (model must exist in current accData or we create it)
+    var maeEl = document.getElementById("def-mae-"+model);
+    var corrEl = document.getElementById("def-corr-"+model);
+    if(maeEl && corrEl){
+      maeEl.value = mae;
+      corrEl.value = corr;
+      filled++;
+    } else {
+      // Model not in current table — add to accData anyway so it's saved
+      if(!accData[model]) accData[model] = {runs:{}};
+      if(!accData[model].runs) accData[model].runs = {};
+      accData[model].runs["default"] = {mae: mae, correction: corr};
+      filled++;
+    }
+  });
+  status.style.color = filled > 0 ? "var(--green)" : "var(--red)";
+  status.textContent = filled + " models filled" + (skipped ? ", " + skipped + " skipped" : "") + " — hit Save Defaults to commit.";
 }
 
 function saveDefaults(){
