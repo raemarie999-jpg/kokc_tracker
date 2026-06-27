@@ -1548,30 +1548,19 @@ function fillDefaultsFromLoaded(){
   var filled = 0;
   Object.keys(accData).forEach(function(model){
     if(model === "NWS") return;
-    var runs = (accData[model] || {}).runs || {};
-    // Collect all non-default run entries and average their mae/correction
-    var maes = [], corrs = [];
-    Object.keys(runs).forEach(function(run){
-      if(run === "default") return;
-      var rd = runs[run];
-      var m = parseFloat(rd.mae); var c = parseFloat(rd.correction);
-      if(!isNaN(m)) maes.push(m);
-      if(!isNaN(c)) corrs.push(c);
-    });
-    if(maes.length === 0 && corrs.length === 0) return;
-    var avgMae = maes.length ? round1(maes.reduce(function(a,b){return a+b},0)/maes.length) : null;
-    var avgCorr = corrs.length ? round1(corrs.reduce(function(a,b){return a+b},0)/corrs.length) : null;
+    var a = accData[model] || {};
+    var mae = parseFloat(a.mae);
+    var corr = parseFloat(a.correction);
+    if(isNaN(mae) && isNaN(corr)) return;
     var maeEl = document.getElementById("def-mae-"+model);
     var corrEl = document.getElementById("def-corr-"+model);
-    if(maeEl && avgMae !== null) maeEl.value = avgMae;
-    if(corrEl && avgCorr !== null) corrEl.value = avgCorr;
+    if(maeEl && !isNaN(mae)) maeEl.value = mae;
+    if(corrEl && !isNaN(corr)) corrEl.value = corr;
     if(maeEl || corrEl) filled++;
   });
   status.style.color = filled > 0 ? "var(--green)" : "var(--red)";
   status.textContent = filled + " models filled from loaded accuracy — hit Save Defaults to commit.";
 }
-
-function round1(v){ return Math.round(v*10)/10; }
 
 function parseAndFillDefaults(){
   var raw = (document.getElementById("paste-defaults-input").value || "").trim();
