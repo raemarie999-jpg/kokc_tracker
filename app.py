@@ -553,7 +553,8 @@ def fetch_all(station="KOKC"):
                 if not todays:
                     add_log(f"{model}: no entries for today", "warn", station)
                     continue
-                if len(todays) < 4:
+                min_entries = 12 if model == "HRRR" else 4
+                if len(todays) < min_entries:
                     add_log(f"{model}: only {len(todays)} entries for today — run not fully ingested yet, keeping previous", "warn", station)
                     continue
                 max_entry = max(todays, key=lambda x: get_temp(x) or 0)
