@@ -152,7 +152,7 @@ STATION_LON = {
 
 ALL_KNOWN_MODELS = [
     "ARPEGE","HRRR","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NAM-MOS","NBM",
-    "NAM4KM","GFS","ICON","GFS-MOS","ECMWF-HRES","GEFS","JMA","RDPS","SREF"
+    "NAM4KM","GFS","ICON","GFS-MOS","NBS-MOS","ECMWF-HRES","GEFS","JMA","RDPS","SREF"
 ]
 RUN_CYCLES = ["00Z","01Z","02Z","03Z","04Z","05Z","06Z","07Z","08Z","09Z","10Z","11Z",
               "12Z","13Z","14Z","15Z","16Z","17Z","18Z","19Z","20Z","21Z","22Z","23Z"]
@@ -553,7 +553,7 @@ def fetch_all(station="KOKC"):
                 if not todays:
                     add_log(f"{model}: no entries for today", "warn", station)
                     continue
-                if len(todays) < 8:
+                if len(todays) < 4:
                     add_log(f"{model}: only {len(todays)} entries for today — run not fully ingested yet, keeping previous", "warn", station)
                     continue
                 max_entry = max(todays, key=lambda x: get_temp(x) or 0)
