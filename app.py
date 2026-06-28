@@ -134,9 +134,19 @@ _SKY_BOOST = [
     (5, 6,  0.5),   # BKN        (5-6 oktas): small boost
     (7, 8,  0.0),   # OVC/OVX    (7-8 oktas): no boost
 ]
-# Wind directions that suppress solar boost (northerly quadrant)
-_NORTHERLY = {"N", "NNE", "NNW", "NE", "NW"}
-# Station longitudes for solar noon calculation
+# Station coordinates for solar elevation calculation
+STATION_LAT = {
+    "KOKC": 35.3931,
+    "KPHL": 39.8719,
+    "KDCA": 38.8521,
+    "KBOS": 42.3629,
+    "KDEN": 39.8561,
+    "KHOU": 29.6454,
+    "KLAS": 36.0800,
+    "KMDW": 41.7868,
+    "KMSP": 44.8848,
+    "KSAT": 29.5337,
+}
 STATION_LON = {
     "KOKC": -97.6007,
     "KPHL": -75.2408,
@@ -148,6 +158,63 @@ STATION_LON = {
     "KMDW": -87.7524,
     "KMSP": -93.2218,
     "KSAT": -98.4700,
+}
+# Per-station wind profiles.
+# suppress: directions that reduce solar heating boost (factor 0.0)
+# enhance:  directions that increase solar heating (factor applied on top of sky boost)
+# neutral directions (not listed) leave boost unchanged (factor 1.0)
+# enhance_factor: multiplier applied to base boost when enhancing wind present
+STATION_WIND_PROFILE = {
+    "KOKC": {
+        "suppress": ["N","NNE","NNW","NE","NW"],
+        "enhance":  ["S","SSW","SW","WSW"],
+        "enhance_factor": 1.3,
+    },
+    "KPHL": {
+        "suppress": ["SE","SSE","ESE","NW","NNW"],  # sea breeze suppresses; post-frontal NW suppresses
+        "enhance":  ["SW","WSW","W"],
+        "enhance_factor": 1.2,
+    },
+    "KDCA": {
+        "suppress": ["E","ESE","SE"],               # Potomac sea breeze suppresses
+        "enhance":  ["SW","WSW","S"],               # SW flow enhances significantly
+        "enhance_factor": 1.3,
+    },
+    "KBOS": {
+        "suppress": ["N","NNE","NE","ENE","E","SE"], # sea breeze + northerly suppress
+        "enhance":  ["SW","WSW","W","NW"],
+        "enhance_factor": 1.2,
+    },
+    "KDEN": {
+        "suppress": ["E","ENE","ESE","NE"],          # upslope suppresses (clouds/precip)
+        "enhance":  ["W","WSW","WNW","SW"],          # chinook downslope enhances
+        "enhance_factor": 1.5,
+    },
+    "KHOU": {
+        "suppress": ["S","SSE","SE","SSW"],          # Gulf moisture suppresses max temp
+        "enhance":  ["N","NNW","NW","W"],            # dry northerly post-frontal enhances
+        "enhance_factor": 1.2,
+    },
+    "KLAS": {
+        "suppress": ["N","NNE","NE","E","ENE"],      # northerly/monsoon moisture suppresses
+        "enhance":  ["W","WSW","SW","S"],            # desert SW flow enhances
+        "enhance_factor": 1.4,
+    },
+    "KMDW": {
+        "suppress": ["N","NNE","NE","ENE","E"],      # Lake Michigan lake breeze suppresses
+        "enhance":  ["SW","WSW","W","S"],
+        "enhance_factor": 1.2,
+    },
+    "KMSP": {
+        "suppress": ["N","NNE","NW","NNW"],          # post-frontal northerly suppresses sharply
+        "enhance":  ["SW","WSW","S","SSW"],
+        "enhance_factor": 1.2,
+    },
+    "KSAT": {
+        "suppress": ["S","SSE","SE","SSW"],          # Gulf moisture suppresses
+        "enhance":  ["N","NNW","NW","W"],            # dry northerly enhances
+        "enhance_factor": 1.2,
+    },
 }
 
 ALL_KNOWN_MODELS = [
@@ -390,38 +457,44 @@ def fetch_metar(station):
         return None
 
 def solar_noon_utc(station, date_utc=None):
-    """
-    Compute approximate solar noon in UTC for a station on the given date.
-    Uses pure Python — no external deps. Accurate to ~1 minute for our purposes.
-    Returns a datetime object (UTC).
-    """
+    """Compute solar noon in UTC using equation of time. Returns datetime (UTC)."""
     if date_utc is None:
         date_utc = datetime.utcnow().date()
     lon = STATION_LON.get(station, -90.0)
-    # Day of year
-    import datetime as _dt
     doy = date_utc.timetuple().tm_yday
-    # Equation of time (minutes) — Spencer's approximation
     B = math.radians((360 / 365) * (doy - 81))
-    eot = 9.87 * math.sin(2 * B) - 7.53 * math.cos(B) - 1.5 * math.sin(B)  # minutes
-    # Solar noon UTC = 12:00 local solar time -> UTC
-    lon_correction_min = lon * 4  # 4 min per degree west = negative
-    solar_noon_local_min = 720  # 12:00 in minutes
-    solar_noon_utc_min = solar_noon_local_min - lon_correction_min - eot
+    eot = 9.87 * math.sin(2 * B) - 7.53 * math.cos(B) - 1.5 * math.sin(B)
+    lon_correction_min = lon * 4
+    solar_noon_utc_min = 720 - lon_correction_min - eot
     h = int(solar_noon_utc_min // 60) % 24
     mins = int(solar_noon_utc_min % 60)
     return datetime(date_utc.year, date_utc.month, date_utc.day, h, mins, 0)
 
+def solar_elevation_deg(station, dt_utc):
+    """Compute solar elevation angle in degrees for station at given UTC datetime."""
+    lat = math.radians(STATION_LAT.get(station, 35.0))
+    lon = STATION_LON.get(station, -90.0)
+    doy = dt_utc.timetuple().tm_yday
+    # Solar declination
+    decl = math.radians(23.45 * math.sin(math.radians((360 / 365) * (doy - 81))))
+    # Hour angle: degrees from solar noon
+    B = math.radians((360 / 365) * (doy - 81))
+    eot = 9.87 * math.sin(2 * B) - 7.53 * math.cos(B) - 1.5 * math.sin(B)  # minutes
+    solar_time_min = (dt_utc.hour * 60 + dt_utc.minute) + lon * 4 + eot
+    hour_angle = math.radians((solar_time_min / 4) - 180)
+    # Elevation
+    sin_elev = (math.sin(lat) * math.sin(decl) +
+                math.cos(lat) * math.cos(decl) * math.cos(hour_angle))
+    return math.degrees(math.asin(max(-1.0, min(1.0, sin_elev))))
+
 def compute_nowcast(station, st):
     """
     Compute a solar-adjusted nowcast high from the current obs temp.
-    Logic:
-      - Find hours remaining to solar noon
-      - Apply sky cover boost (tiered) if time is before solar noon
-      - Suppress boost if northerly wind
-      - Return None if obs is missing or solar noon has passed by > 2 hours
-    Returns a dict: {nowcast, solar_noon_utc, hours_to_noon, sky_boost, suppressed}
-    or None on failure.
+    - Sky cover boost from METAR oktas
+    - Time scaling based on true solar elevation angle (peaks at solar noon)
+    - Per-station wind profile: suppress/enhance boost based on wind direction
+    - Wind speed continuous suppression: full boost calm, zero boost >= 25kt
+    Returns a dict or None on failure.
     """
     try:
         obs = st.get("obs") or {}
@@ -431,39 +504,64 @@ def compute_nowcast(station, st):
         metar = st.get("metar") or {}
         sky_oktas = metar.get("sky_oktas")
         wind_dir = metar.get("wind_dir")
+        wind_kt = _safe_float(metar.get("wind_speed_kt")) or 0.0
+
         now_utc = datetime.utcnow()
         noon_utc = solar_noon_utc(station, now_utc.date())
         hours_to_noon = (noon_utc - now_utc).total_seconds() / 3600.0
+
         # Don't nowcast if solar noon has passed by more than 2 hours
         if hours_to_noon < -2.0:
             return None
-        # Determine sky boost
-        boost = 0.0
+
+        # Solar elevation at current time and at noon — use ratio as time factor
+        elev_now = solar_elevation_deg(station, now_utc)
+        elev_noon = solar_elevation_deg(station, noon_utc)
+        if elev_noon > 0 and elev_now > 0:
+            time_factor = min(1.0, elev_now / elev_noon)
+        else:
+            time_factor = max(0.0, min(1.0, hours_to_noon / 4.0))
+
+        # Sky cover base boost
+        boost = 1.0  # unknown sky: modest default
         if sky_oktas is not None:
             for lo, hi, b in _SKY_BOOST:
                 if lo <= sky_oktas <= hi:
                     boost = b
                     break
-        else:
-            boost = 1.0  # unknown sky: use modest default
-        # Suppress boost for northerly winds
-        suppressed = False
-        if wind_dir in _NORTHERLY and boost > 0:
-            boost = 0.0
-            suppressed = True
-        # Scale boost by time remaining (more boost if further from noon)
-        time_factor = max(0.0, min(1.0, hours_to_noon / 4.0))
+
+        # Per-station wind direction factor
+        wind_effect = "neutral"
+        profile = STATION_WIND_PROFILE.get(station, {})
+        if wind_dir:
+            if wind_dir in profile.get("suppress", []):
+                boost = 0.0
+                wind_effect = "suppress"
+            elif wind_dir in profile.get("enhance", []):
+                boost = boost * profile.get("enhance_factor", 1.2)
+                wind_effect = "enhance"
+
+        # Wind speed continuous suppression (independent of direction effect)
+        # Full boost calm -> zero boost at 25kt+
+        if wind_effect != "suppress":
+            speed_factor = max(0.0, 1.0 - (wind_kt / 25.0))
+            boost = boost * speed_factor
+
         scaled_boost = round(boost * time_factor, 1)
         nowcast = round(obs_temp + scaled_boost, 1)
         return {
             "nowcast": nowcast,
             "obs_temp": obs_temp,
             "solar_noon_utc": noon_utc.strftime("%H:%MZ"),
+            "solar_elevation": round(elev_now, 1),
+            "solar_elevation_noon": round(elev_noon, 1),
             "hours_to_noon": round(hours_to_noon, 2),
+            "time_factor": round(time_factor, 2),
             "sky_boost": scaled_boost,
-            "suppressed": suppressed,
-            "sky_oktas": sky_oktas,
+            "wind_effect": wind_effect,
             "wind_dir": wind_dir,
+            "wind_kt": wind_kt,
+            "sky_oktas": sky_oktas,
         }
     except Exception:
         return None
