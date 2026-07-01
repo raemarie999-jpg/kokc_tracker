@@ -510,8 +510,10 @@ def compute_nowcast(station, st):
         noon_utc = solar_noon_utc(station, now_utc.date())
         hours_to_noon = (noon_utc - now_utc).total_seconds() / 3600.0
 
-        # Don't nowcast if solar noon has passed by more than 2 hours
-        if hours_to_noon < -2.0:
+        # Solar noon is deterministic and known in advance for each station.
+        # Once it has passed, the heating phase is over — no projection is made.
+        # The observed max stands on its own from this point forward.
+        if hours_to_noon < 0:
             return None
 
         # Solar elevation at current time and at noon — use ratio as time factor
