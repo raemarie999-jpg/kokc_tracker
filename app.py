@@ -225,6 +225,30 @@ RUN_CYCLES = ["00Z","01Z","02Z","03Z","04Z","05Z","06Z","07Z","08Z","09Z","10Z",
               "12Z","13Z","14Z","15Z","16Z","17Z","18Z","19Z","20Z","21Z","22Z","23Z"]
 REFRESH_SEC = 1800  # 30 min between auto-refresh cycles; use NOW button for on-demand updates
 
+# Quiet hours: auto-fetch (background loop) is skipped during this window to conserve
+# the shared wethr.net daily API cap. Manual refresh (NOW button, /api/refresh) is NOT
+# affected and works 24/7. Window is checked against a single reference station's local
+# clock (not per-station) so all auto-fetch pauses/resumes at the same wall-clock time.
+QUIET_HOURS_START = 19   # 7pm local (24h)
+QUIET_HOURS_END = 5      # 5am local (24h)
+QUIET_HOURS_REF_STATION = "KOKC"
+
+# Typical lag between solar noon and the actual daily high (climatological default;
+# actual lag varies by station/season/air mass, but 3.5hr is a reasonable general value
+# consistent with the ~4:30-4:40pm typical-high windows seen for solar noon ~1:10-1:15pm).
+TYPICAL_PEAK_LAG_HOURS = 3.5
+
+# Minimum spacing between obs samples used for rate calculations. Prevents a pair
+# of back-to-back manual refreshes (seconds/minutes apart) from producing a wild
+# divide-by-near-zero warming rate.
+MIN_INTERVAL_HOURS = 0.15  # ~9 minutes
+
+def in_quiet_hours():
+    hour = station_local_now(QUIET_HOURS_REF_STATION).hour
+    if QUIET_HOURS_START > QUIET_HOURS_END:
+        return hour >= QUIET_HOURS_START or hour < QUIET_HOURS_END
+    return QUIET_HOURS_START <= hour < QUIET_HOURS_END
+
 def make_state():
     return {
         "obs": None,
@@ -568,6 +592,146 @@ def compute_nowcast(station, st):
     except Exception:
         return None
 
+def get_today_obs_samples(station="KOKC"):
+    """
+    Returns today's [(local_datetime, obs_temp), ...] built from pacing snapshot
+    history (populated every fetch_all cycle, auto or manual). Sorted ascending.
+    """
+    now = station_local_now(station)
+    date_str = now.strftime("%Y-%m-%d")
+    disk = load_json_file(f"{DATA_DIR}/pacing_{station}.json", {})
+    day = disk.get(date_str, [])
+    samples = []
+    for e in day:
+        t = e.get("time")
+        obs = e.get("obs")
+        if t is None or obs is None:
+            continue
+        try:
+            hh, mm = t.split(":")
+            dt = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+            samples.append((dt, float(obs)))
+        except Exception:
+            continue
+    samples.sort(key=lambda x: x[0])
+    return samples
+
+def compute_today_high_projection(station="KOKC"):
+    """
+    Projects today's high from the OBSERVED warming-rate trend, not a fixed solar
+    curve. Builds hourly warming-rate intervals between consecutive obs samples
+    (skipping intervals shorter than MIN_INTERVAL_HOURS to avoid noise from
+    back-to-back manual refreshes), then:
+      1. If the most recent rate is >= the prior rate, we're still in the
+         still-accelerating morning phase — use a conservative capped bridge
+         instead of extrapolating an undefined decay curve.
+      2. If the rate is already <= 0, warming has stopped/reversed — today's
+         obs stands as the high.
+      3. Otherwise, fit an exponential decay. With >=3 clean positive-rate
+         intervals, fit via least-squares regression across the last 5 (more
+         stable — one noisy sample can't flip the whole projection). With
+         exactly 2 intervals, fall back to the direct two-point decay constant.
+      Integrates the decaying rate forward to the typical high time (solar
+      noon + TYPICAL_PEAK_LAG_HOURS).
+    Returns a dict, or {"error": ...} if there isn't enough data yet.
+    """
+    samples = get_today_obs_samples(station)
+    if len(samples) < 3:
+        return {"error": "insufficient_data", "samples": len(samples), "need": 3}
+
+    intervals = []  # (midpoint_time, rate_F_per_hr, dt_hr)
+    for i in range(1, len(samples)):
+        t_a, T_a = samples[i - 1]
+        t_b, T_b = samples[i]
+        dt = (t_b - t_a).total_seconds() / 3600.0
+        if dt < MIN_INTERVAL_HOURS:
+            continue
+        rate = (T_b - T_a) / dt
+        mid = t_a + (t_b - t_a) / 2
+        intervals.append((mid, rate, dt))
+
+    if len(intervals) < 2:
+        return {"error": "insufficient_spaced_data", "samples": len(samples)}
+
+    t_last, T_last = samples[-1]
+    now_local = station_local_now(station)
+    noon_utc = solar_noon_utc(station, now_local.date())
+    offset = STATION_TZ_OFFSET.get(station, -6)
+    noon_local = noon_utc + timedelta(hours=offset)
+    peak_time_local = noon_local + timedelta(hours=TYPICAL_PEAK_LAG_HOURS)
+    remaining_hours = (peak_time_local - t_last).total_seconds() / 3600.0
+
+    samples_used = [{"time": t.strftime("%H:%M"), "temp": v} for t, v in samples[-4:]]
+
+    if remaining_hours <= 0:
+        return {
+            "projected_high": T_last, "added_warming": 0.0, "method": "past_peak_window",
+            "obs_now": T_last, "remaining_hours": round(remaining_hours, 2),
+            "peak_time_local": peak_time_local.strftime("%I:%M%p").lstrip("0"),
+            "samples_used": samples_used,
+        }
+
+    rate_latest = intervals[-1][1]
+    rate_prev = intervals[-2][1]
+
+    if rate_latest <= 0:
+        method = "already_peaked"
+        added = 0.0
+        projected_high = T_last
+    elif rate_prev <= 0 or rate_latest >= rate_prev:
+        method = "linear_bridge_capped"
+        bridge_hours = min(remaining_hours, 1.5)
+        added = rate_latest * bridge_hours
+        projected_high = round(T_last + added, 1)
+    else:
+        # Only fit the decay using the monotonically non-increasing tail of
+        # intervals (walking back from the latest). This is essential: the
+        # rate often accelerates through the morning before it starts
+        # decaying, and blending that acceleration phase into the regression
+        # would understate how sharply the rate just turned over.
+        tail = [intervals[-1]]
+        for iv in reversed(intervals[:-1]):
+            if iv[1] >= tail[0][1]:
+                tail.insert(0, iv)
+            else:
+                break
+        recent = [iv for iv in tail if iv[1] > 0]
+
+        if len(recent) >= 3:
+            method = "decay_integration_regression"
+            t0 = recent[0][0]
+            xs = [(m - t0).total_seconds() / 3600.0 for m, r, dt in recent]
+            ys = [math.log(r) for m, r, dt in recent]
+            n = len(xs)
+            mean_x = sum(xs) / n
+            mean_y = sum(ys) / n
+            num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+            den = sum((x - mean_x) ** 2 for x in xs)
+            slope = (num / den) if den > 0 else -0.01
+            k = max(-slope, 0.01)
+            intercept = mean_y - slope * mean_x
+            x_last = (t_last - t0).total_seconds() / 3600.0
+            rate_now = math.exp(intercept + slope * x_last)
+        else:
+            method = "decay_integration_2pt"
+            k = math.log(rate_prev / rate_latest) / intervals[-1][2]
+            k = max(k, 0.01)
+            rate_now = rate_latest
+        added = (rate_now / k) * (1 - math.exp(-k * remaining_hours))
+        projected_high = round(T_last + added, 1)
+
+    return {
+        "projected_high": projected_high,
+        "added_warming": round(added, 1),
+        "method": method,
+        "obs_now": T_last,
+        "rate_latest": round(rate_latest, 2),
+        "rate_prev": round(rate_prev, 2),
+        "remaining_hours": round(remaining_hours, 2),
+        "peak_time_local": peak_time_local.strftime("%I:%M%p").lstrip("0"),
+        "samples_used": samples_used,
+    }
+
 def fetch_all(station="KOKC"):
     st = get_state(station)
     if not API_KEY:
@@ -737,6 +901,9 @@ def save_pacing_snapshot(rows, station="KOKC"):
     time_str = now.strftime("%H:%M")
 
     entry = {"time": time_str}
+    obs_temp_snap = _safe_float((st.get("obs") or {}).get("temperature_display"))
+    if obs_temp_snap is not None:
+        entry["obs"] = obs_temp_snap
     for r in rows:
         if r.get("pace") is not None:
             entry[r["model"]] = r["pace"]
@@ -814,7 +981,15 @@ def scheduled_fetch():
     """
     Auto-fetch background stations only. All 10 stations are valid and fetchable
     on demand via the NOW button; only BACKGROUND_STATIONS run automatically.
+    Skipped entirely during quiet hours (see QUIET_HOURS_START/END) to save API quota;
+    the NOW button still works normally during quiet hours.
     """
+    if in_quiet_hours():
+        add_log(
+            f"Quiet hours ({QUIET_HOURS_START}:00-{QUIET_HOURS_END}:00 {QUIET_HOURS_REF_STATION} local) — skipping auto-fetch",
+            "info", QUIET_HOURS_REF_STATION
+        )
+        return
     for i, station in enumerate(BACKGROUND_STATIONS):
         if i > 0:
             gap = 10 + random.uniform(2, 5)
@@ -1073,6 +1248,11 @@ def api_state():
         conditions_data = {}
         nowcast_data = None
 
+    try:
+        today_high_projection = compute_today_high_projection(station)
+    except Exception as e:
+        today_high_projection = {"error": str(e)}
+
     return jsonify({
         "station": station, "obs": st["obs"], "wethr_high": st["wethr_high"],
         "rows": rows, "consensus": consensus,
@@ -1086,6 +1266,7 @@ def api_state():
         "prev_days": _get_prev_days(3, station),
         "conditions": conditions_data,
         "nowcast": nowcast_data,
+        "today_high_projection": today_high_projection,
         "solar_noon_obs": _safe_float(st.get("solar_noon_obs")),
     })
 
