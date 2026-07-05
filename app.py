@@ -1587,6 +1587,17 @@ th.default-col{color:var(--orange) !important}
     <div style="font-size:10px;color:var(--dimmer);margin-top:4px" id="cond-metar-raw"></div>
   </div>
 
+  <div class="card" id="thp-card" style="display:none">
+    <div class="ctitle">Today's High Projection <span style="color:var(--dimmer);font-weight:400">(rate-decay, obs-based)</span></div>
+    <div class="srow" style="margin-bottom:4px">
+      <div class="sc"><div class="lbl">Projected High</div><div class="v" id="thp-value" style="color:var(--orange);font-size:20px">--</div><div class="s" id="thp-method">--</div></div>
+      <div class="sc"><div class="lbl">Latest Rate</div><div class="v" id="thp-rate-latest" style="font-size:16px">--</div><div class="s">F/hr</div></div>
+      <div class="sc"><div class="lbl">Prior Rate</div><div class="v" id="thp-rate-prev" style="font-size:16px">--</div><div class="s">F/hr</div></div>
+      <div class="sc"><div class="lbl">Typical Peak</div><div class="v" id="thp-peak-time" style="font-size:16px">--</div><div class="s" id="thp-remaining">--</div></div>
+    </div>
+    <div style="font-size:10px;color:var(--dimmer);margin-top:4px" id="thp-samples"></div>
+  </div>
+
   <div class="card" id="nws-card" style="display:none">
     <div class="ctitle">NWS Forecast Versions</div>
     <div style="overflow-x:auto">
@@ -2333,6 +2344,53 @@ function render(data){
       if(condCard) condCard.style.display = "none";
     }
   } catch(e){ console.error("Conditions render error", e); }
+
+  // --- Today's High Projection rendering ---
+  try {
+    var thp = data.today_high_projection;
+    var thpCard = document.getElementById("thp-card");
+    var methodLabels = {
+      "decay_integration_regression": "decay fit (multi-pt)",
+      "decay_integration_2pt": "decay fit (2-pt)",
+      "linear_bridge_capped": "still accelerating — capped bridge",
+      "already_peaked": "rate stopped — obs is the high",
+      "past_peak_window": "past typical peak window"
+    };
+    if(thp && thp.projected_high != null){
+      if(thpCard) thpCard.style.display = "block";
+      var elV = document.getElementById("thp-value");
+      if(elV) elV.textContent = thp.projected_high + "F";
+      var elM = document.getElementById("thp-method");
+      if(elM) elM.textContent = methodLabels[thp.method] || thp.method || "--";
+      var elRL = document.getElementById("thp-rate-latest");
+      if(elRL) elRL.textContent = thp.rate_latest != null ? (thp.rate_latest>=0?"+":"")+thp.rate_latest : "--";
+      var elRP = document.getElementById("thp-rate-prev");
+      if(elRP) elRP.textContent = thp.rate_prev != null ? (thp.rate_prev>=0?"+":"")+thp.rate_prev : "--";
+      var elPT = document.getElementById("thp-peak-time");
+      if(elPT) elPT.textContent = thp.peak_time_local || "--";
+      var elRem = document.getElementById("thp-remaining");
+      if(elRem) elRem.textContent = thp.remaining_hours != null ? thp.remaining_hours + "h left" : "--";
+      var elSamp = document.getElementById("thp-samples");
+      if(elSamp && thp.samples_used){
+        elSamp.textContent = "Samples: " + thp.samples_used.map(function(s){ return s.time+"="+s.temp+"F"; }).join("  ");
+      }
+    } else if(thp && thp.error){
+      if(thpCard) thpCard.style.display = "block";
+      var elV2 = document.getElementById("thp-value");
+      if(elV2) elV2.textContent = "--";
+      var elM2 = document.getElementById("thp-method");
+      if(elM2) elM2.textContent = thp.error === "insufficient_data"
+        ? ("collecting obs (" + (thp.samples||0) + "/" + (thp.need||3) + ")")
+        : thp.error;
+      ["thp-rate-latest","thp-rate-prev","thp-peak-time","thp-remaining"].forEach(function(id){
+        var el = document.getElementById(id); if(el) el.textContent = "--";
+      });
+      var elSamp2 = document.getElementById("thp-samples");
+      if(elSamp2) elSamp2.textContent = "";
+    } else {
+      if(thpCard) thpCard.style.display = "none";
+    }
+  } catch(e){ console.error("Today's High Projection render error", e); }
 }
 
 function poll(){
