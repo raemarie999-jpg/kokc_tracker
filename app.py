@@ -595,6 +595,12 @@ def compute_nowcast(station, st):
 STALE_DUP_MINUTES = 15  # if two readings show the identical temp within this window,
                          # treat them as the same underlying station ob, not new data
 
+# Sanity cap on how much warming any "we're not sure yet, bridge forward" fallback
+# is allowed to add. A single noisy short interval (e.g. 12 min) can produce an
+# implausible instantaneous rate; without this cap, bridging that rate forward
+# even 1.5hr can blow past every model's forecast.
+MAX_BRIDGE_ADDED_F = 6.0
+
 def get_today_obs_samples(station="KOKC"):
     """
     Returns today's [(local_datetime, obs_temp), ...] built from pacing snapshot
@@ -706,13 +712,23 @@ def compute_today_high_projection(station="KOKC"):
     rate_prev = intervals[-2][1]
 
     if rate_latest <= 0:
-        method = "already_peaked"
-        added = 0.0
-        projected_high = T_last
+        if rate_prev <= 0:
+            method = "already_peaked"
+            added = 0.0
+            projected_high = T_last
+        else:
+            # A single flat/negative interval right after a positive one is
+            # more likely short-term noise (cloud, obs blip) than a confirmed
+            # peak — don't fully commit to "already peaked" off one reading.
+            # Bridge forward cautiously using half the prior confirmed rate.
+            method = "plateau_unconfirmed"
+            bridge_hours = min(remaining_hours, 1.5)
+            added = min(0.5 * rate_prev * bridge_hours, MAX_BRIDGE_ADDED_F)
+            projected_high = round(T_last + added, 1)
     elif rate_prev <= 0 or rate_latest >= rate_prev:
         method = "linear_bridge_capped"
         bridge_hours = min(remaining_hours, 1.5)
-        added = rate_latest * bridge_hours
+        added = min(rate_latest * bridge_hours, MAX_BRIDGE_ADDED_F)
         projected_high = round(T_last + added, 1)
     else:
         # Only fit the decay using the monotonically non-increasing tail of
@@ -2385,6 +2401,7 @@ function render(data){
       "decay_integration_regression": "decay fit (multi-pt)",
       "decay_integration_2pt": "decay fit (2-pt)",
       "linear_bridge_capped": "still accelerating — capped bridge",
+      "plateau_unconfirmed": "brief plateau — unconfirmed, cautious bridge",
       "already_peaked": "rate stopped — obs is the high",
       "past_peak_window": "past typical peak window"
     };
