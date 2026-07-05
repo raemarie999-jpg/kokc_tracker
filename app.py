@@ -592,27 +592,58 @@ def compute_nowcast(station, st):
     except Exception:
         return None
 
+STALE_DUP_MINUTES = 15  # if two readings show the identical temp within this window,
+                         # treat them as the same underlying station ob, not new data
+
 def get_today_obs_samples(station="KOKC"):
     """
     Returns today's [(local_datetime, obs_temp), ...] built from pacing snapshot
     history (populated every fetch_all cycle, auto or manual). Sorted ascending.
+
+    Dedupes two ways:
+      1. By the station's obs_time field, when present and actually changing.
+      2. By value: if the temp is identical to the last kept sample and the two
+         are within STALE_DUP_MINUTES of each other, skip it. This is the primary
+         real-world guard — ASOS/METAR obs often refresh slower than our poll
+         cadence, and some upstream APIs stamp observation_time with the API
+         response time rather than the true station reading time, which makes
+         guard #1 alone unreliable. Without this, repeated identical readings
+         look like "warming rate = 0" and falsely trigger "already peaked."
     """
     now = station_local_now(station)
     date_str = now.strftime("%Y-%m-%d")
     disk = load_json_file(f"{DATA_DIR}/pacing_{station}.json", {})
     day = disk.get(date_str, [])
     samples = []
+    last_obs_time = None
+    last_kept_dt = None
+    last_kept_temp = None
     for e in day:
         t = e.get("time")
         obs = e.get("obs")
+        obs_time = e.get("obs_time")
         if t is None or obs is None:
             continue
         try:
             hh, mm = t.split(":")
             dt = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
-            samples.append((dt, float(obs)))
+            obs_f = float(obs)
         except Exception:
             continue
+
+        if obs_time is not None and obs_time == last_obs_time:
+            continue  # confirmed same underlying station reading
+
+        if (last_kept_temp is not None and obs_f == last_kept_temp
+                and last_kept_dt is not None
+                and abs((dt - last_kept_dt).total_seconds()) / 60.0 < STALE_DUP_MINUTES):
+            continue  # identical temp within a short window — source likely hasn't refreshed
+
+        samples.append((dt, obs_f))
+        last_kept_dt = dt
+        last_kept_temp = obs_f
+        if obs_time is not None:
+            last_obs_time = obs_time
     samples.sort(key=lambda x: x[0])
     return samples
 
@@ -904,6 +935,7 @@ def save_pacing_snapshot(rows, station="KOKC"):
     obs_temp_snap = _safe_float((st.get("obs") or {}).get("temperature_display"))
     if obs_temp_snap is not None:
         entry["obs"] = obs_temp_snap
+        entry["obs_time"] = (st.get("obs") or {}).get("observation_time")
     for r in rows:
         if r.get("pace") is not None:
             entry[r["model"]] = r["pace"]
