@@ -25,7 +25,7 @@ _last_manual_refresh = {}
 MANUAL_REFRESH_COOLDOWN_SEC = 120  # min seconds between manual refreshes, per station
 
 # --- Hard daily API cap: resets at 19:30 UTC (= 3:30pm EDT / 2:30pm EST) ---
-DAILY_REQUEST_CAP = 3250
+DAILY_REQUEST_CAP = 4500
 _CAP_RESET_UTC_HOUR = 19
 _CAP_RESET_UTC_MINUTE = 30
 _counter_lock = threading.Lock()
