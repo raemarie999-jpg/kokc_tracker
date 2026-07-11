@@ -25,7 +25,7 @@ _last_manual_refresh = {}
 MANUAL_REFRESH_COOLDOWN_SEC = 120  # min seconds between manual refreshes, per station
 
 # --- Hard daily API cap: resets at 19:30 UTC (= 3:30pm EDT / 2:30pm EST) ---
-DAILY_REQUEST_CAP = 4500
+DAILY_REQUEST_CAP = 3250
 _CAP_RESET_UTC_HOUR = 19
 _CAP_RESET_UTC_MINUTE = 30
 _counter_lock = threading.Lock()
@@ -511,6 +511,8 @@ def solar_elevation_deg(station, dt_utc):
                 math.cos(lat) * math.cos(decl) * math.cos(hour_angle))
     return math.degrees(math.asin(max(-1.0, min(1.0, sin_elev))))
 
+NOWCAST_EMA_ALPHA = 0.35  # weight given to the newest reading; lower = smoother/slower to react
+
 def compute_nowcast(station, st):
     """
     Compute a solar-adjusted nowcast high from the current obs temp.
@@ -518,6 +520,11 @@ def compute_nowcast(station, st):
     - Time scaling based on true solar elevation angle (peaks at solar noon)
     - Per-station wind profile: suppress/enhance boost based on wind direction
     - Wind speed continuous suppression: full boost calm, zero boost >= 25kt
+    The sky/wind-derived boost is EMA-smoothed across fetches (a single passing
+    cloud or gust otherwise causes the boost to swing by its full range from one
+    fetch to the next, since oktas/wind can change tier or flip direction-effect
+    between 30-min polls). obs_temp itself is left raw/unsmoothed — it's a real
+    ground-truth reading, not something that should be damped.
     Returns a dict or None on failure.
     """
     try:
@@ -533,20 +540,30 @@ def compute_nowcast(station, st):
         now_utc = datetime.utcnow()
         noon_utc = solar_noon_utc(station, now_utc.date())
         hours_to_noon = (noon_utc - now_utc).total_seconds() / 3600.0
+        peak_utc = noon_utc + timedelta(hours=TYPICAL_PEAK_LAG_HOURS)
+        hours_to_peak = (peak_utc - now_utc).total_seconds() / 3600.0
 
-        # Solar noon is deterministic and known in advance for each station.
-        # Once it has passed, the heating phase is over — no projection is made.
-        # The observed max stands on its own from this point forward.
-        if hours_to_noon < 0:
+        # The heating phase runs through solar noon and continues, at a decaying
+        # rate, out to the typical peak-heating time (solar noon + lag) — same
+        # peak-lag assumption used by today_high_projection. Past that point,
+        # the observed max stands on its own; no further boost is projected.
+        if hours_to_peak < 0:
             return None
 
-        # Solar elevation at current time and at noon — use ratio as time factor
+        # Solar elevation ratio drives the ramp-up before noon (0 -> 1).
+        # After noon, ramp back down from 1 -> 0 across the peak-lag window,
+        # since insolation itself is already declining but surface heating
+        # still has thermal lag to catch up before the actual daily high.
         elev_now = solar_elevation_deg(station, now_utc)
         elev_noon = solar_elevation_deg(station, noon_utc)
-        if elev_noon > 0 and elev_now > 0:
-            time_factor = min(1.0, elev_now / elev_noon)
+        if hours_to_noon >= 0:
+            if elev_noon > 0 and elev_now > 0:
+                time_factor = min(1.0, elev_now / elev_noon)
+            else:
+                time_factor = max(0.0, min(1.0, hours_to_noon / 4.0))
         else:
-            time_factor = max(0.0, min(1.0, hours_to_noon / 4.0))
+            hours_since_noon = -hours_to_noon
+            time_factor = max(0.0, 1.0 - (hours_since_noon / TYPICAL_PEAK_LAG_HOURS))
 
         # Sky cover base boost
         boost = 1.0  # unknown sky: modest default
@@ -573,8 +590,22 @@ def compute_nowcast(station, st):
             speed_factor = max(0.0, 1.0 - (wind_kt / 25.0))
             boost = boost * speed_factor
 
-        scaled_boost = round(boost * time_factor, 1)
-        nowcast = round(obs_temp + scaled_boost, 1)
+        scaled_boost_raw = round(boost * time_factor, 2)
+
+        # EMA-smooth the boost across fetches, reset at local day rollover
+        today_str = station_local_now(station).strftime("%Y-%m-%d")
+        ema_key = f"_nowcast_ema_{station}"
+        ema_date_key = f"_nowcast_ema_date_{station}"
+        prev_ema = st.get(ema_key)
+        prev_date = st.get(ema_date_key)
+        if prev_ema is None or prev_date != today_str:
+            smoothed_boost = scaled_boost_raw  # first reading of the day — no history to smooth against
+        else:
+            smoothed_boost = round(NOWCAST_EMA_ALPHA * scaled_boost_raw + (1 - NOWCAST_EMA_ALPHA) * prev_ema, 2)
+        st[ema_key] = smoothed_boost
+        st[ema_date_key] = today_str
+
+        nowcast = round(obs_temp + smoothed_boost, 1)
         return {
             "nowcast": nowcast,
             "obs_temp": obs_temp,
@@ -582,8 +613,10 @@ def compute_nowcast(station, st):
             "solar_elevation": round(elev_now, 1),
             "solar_elevation_noon": round(elev_noon, 1),
             "hours_to_noon": round(hours_to_noon, 2),
+            "hours_to_peak": round(hours_to_peak, 2),
             "time_factor": round(time_factor, 2),
-            "sky_boost": scaled_boost,
+            "sky_boost": smoothed_boost,
+            "sky_boost_raw": scaled_boost_raw,
             "wind_effect": wind_effect,
             "wind_dir": wind_dir,
             "wind_kt": wind_kt,
@@ -601,25 +634,17 @@ STALE_DUP_MINUTES = 15  # if two readings show the identical temp within this wi
 # even 1.5hr can blow past every model's forecast.
 MAX_BRIDGE_ADDED_F = 6.0
 
-def get_today_obs_samples(station="KOKC"):
+def get_obs_samples_for_date(station, date_str):
     """
-    Returns today's [(local_datetime, obs_temp), ...] built from pacing snapshot
-    history (populated every fetch_all cycle, auto or manual). Sorted ascending.
-
-    Dedupes two ways:
-      1. By the station's obs_time field, when present and actually changing.
-      2. By value: if the temp is identical to the last kept sample and the two
-         are within STALE_DUP_MINUTES of each other, skip it. This is the primary
-         real-world guard — ASOS/METAR obs often refresh slower than our poll
-         cadence, and some upstream APIs stamp observation_time with the API
-         response time rather than the true station reading time, which makes
-         guard #1 alone unreliable. Without this, repeated identical readings
-         look like "warming rate = 0" and falsely trigger "already peaked."
+    Same dedup logic as get_today_obs_samples, but for an arbitrary past date.
+    Used by rollup_projection_verification once a day has fully closed out.
     """
-    now = station_local_now(station)
-    date_str = now.strftime("%Y-%m-%d")
     disk = load_json_file(f"{DATA_DIR}/pacing_{station}.json", {})
     day = disk.get(date_str, [])
+    try:
+        base_date = datetime.strptime(date_str, "%Y-%m-%d")
+    except Exception:
+        return []
     samples = []
     last_obs_time = None
     last_kept_dt = None
@@ -632,19 +657,16 @@ def get_today_obs_samples(station="KOKC"):
             continue
         try:
             hh, mm = t.split(":")
-            dt = now.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
+            dt = base_date.replace(hour=int(hh), minute=int(mm), second=0, microsecond=0)
             obs_f = float(obs)
         except Exception:
             continue
-
         if obs_time is not None and obs_time == last_obs_time:
-            continue  # confirmed same underlying station reading
-
+            continue
         if (last_kept_temp is not None and obs_f == last_kept_temp
                 and last_kept_dt is not None
                 and abs((dt - last_kept_dt).total_seconds()) / 60.0 < STALE_DUP_MINUTES):
-            continue  # identical temp within a short window — source likely hasn't refreshed
-
+            continue
         samples.append((dt, obs_f))
         last_kept_dt = dt
         last_kept_temp = obs_f
@@ -652,6 +674,15 @@ def get_today_obs_samples(station="KOKC"):
             last_obs_time = obs_time
     samples.sort(key=lambda x: x[0])
     return samples
+
+def get_today_obs_samples(station="KOKC"):
+    """
+    Returns today's [(local_datetime, obs_temp), ...] built from pacing snapshot
+    history (populated every fetch_all cycle, auto or manual). Sorted ascending.
+    Thin wrapper around get_obs_samples_for_date for today's date.
+    """
+    now = station_local_now(station)
+    return get_obs_samples_for_date(station, now.strftime("%Y-%m-%d"))
 
 def compute_today_high_projection(station="KOKC"):
     """
@@ -778,6 +809,93 @@ def compute_today_high_projection(station="KOKC"):
         "peak_time_local": peak_time_local.strftime("%I:%M%p").lstrip("0"),
         "samples_used": samples_used,
     }
+
+def log_projection_snapshot(station="KOKC"):
+    """
+    Records the current today_high_projection result to disk, timestamped.
+    Called once per fetch_all cycle (auto or manual). This is the raw feed
+    for verification: it lets us see what the projection was saying at every
+    point through the day, not just the final number, so we can measure how
+    fast/well it converges toward the actual high as more obs come in.
+    Silently skips logging when there's no valid projection yet (insufficient
+    data, past peak window with no data, etc.) — nothing meaningful to record.
+    """
+    try:
+        proj = compute_today_high_projection(station)
+        if not proj or proj.get("error"):
+            return
+        now_local = station_local_now(station)
+        date_str = now_local.strftime("%Y-%m-%d")
+        time_str = now_local.strftime("%H:%M")
+        log_file = f"{DATA_DIR}/projection_log_{station}.json"
+        disk = load_json_file(log_file, {})
+        day = disk.setdefault(date_str, [])
+        # Avoid double-logging if a fetch happens twice in the same minute
+        if day and day[-1].get("time") == time_str:
+            day[-1] = {
+                "time": time_str, "projected_high": proj.get("projected_high"),
+                "method": proj.get("method"), "obs_now": proj.get("obs_now"),
+                "rate_latest": proj.get("rate_latest"), "rate_prev": proj.get("rate_prev"),
+            }
+        else:
+            day.append({
+                "time": time_str, "projected_high": proj.get("projected_high"),
+                "method": proj.get("method"), "obs_now": proj.get("obs_now"),
+                "rate_latest": proj.get("rate_latest"), "rate_prev": proj.get("rate_prev"),
+            })
+        save_json_file(log_file, disk)
+    except Exception as e:
+        add_log(f"Projection log error: {e}", "warn", station)
+
+def rollup_projection_verification(station="KOKC"):
+    """
+    Once a day has fully closed out, compares the day's final logged projection
+    against the actual observed high (max of that day's deduped obs samples)
+    and stores the result permanently. This is the dataset to eventually spot
+    systemic bias (e.g. "projections consistently run 2F hot") and recalibrate
+    TYPICAL_PEAK_LAG_HOURS / MAX_BRIDGE_ADDED_F / etc. against real outcomes
+    instead of guessing at constants.
+    """
+    now = station_local_now(station)
+    yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+    ver_file = f"{DATA_DIR}/projection_verification_{station}.json"
+    ver = load_json_file(ver_file, {})
+    if yesterday in ver:
+        return  # already rolled up, don't overwrite
+
+    samples = get_obs_samples_for_date(station, yesterday)
+    if not samples:
+        return  # no obs data recorded that day — nothing to verify against
+
+    actual_high = round(max(v for _, v in samples), 1)
+
+    log_file = f"{DATA_DIR}/projection_log_{station}.json"
+    log_disk = load_json_file(log_file, {})
+    day_log = log_disk.get(yesterday, [])
+    if not day_log:
+        return  # no projections were logged that day (feature not live yet, etc.)
+
+    final = day_log[-1]
+    first = day_log[0]
+    final_proj = final.get("projected_high")
+    error = round(final_proj - actual_high, 1) if final_proj is not None else None
+
+    ver[yesterday] = {
+        "actual_high": actual_high,
+        "final_projection": final_proj,
+        "final_method": final.get("method"),
+        "final_projection_time": final.get("time"),
+        "error": error,
+        "first_projection": first.get("projected_high"),
+        "first_projection_time": first.get("time"),
+        "projection_count": len(day_log),
+    }
+    save_json_file(ver_file, ver)
+    add_log(
+        f"Projection verification for {yesterday}: actual={actual_high}F "
+        f"final_proj={final_proj}F error={error}",
+        "ok", station
+    )
 
 def fetch_all(station="KOKC"):
     st = get_state(station)
@@ -919,6 +1037,11 @@ def fetch_all(station="KOKC"):
         save_pacing_snapshot(rows, station)
     except Exception as e:
         add_log(f"Snapshot error: {e}", "warn", station)
+
+    try:
+        log_projection_snapshot(station)
+    except Exception as e:
+        add_log(f"Projection snapshot log error: {e}", "warn", station)
 
     try:
         now_local = station_local_now(station)
@@ -1189,6 +1312,7 @@ def background_loop():
                 now = station_local_now(station)
                 if now.hour == 1:
                     rollup_daily_history(station)
+                    rollup_projection_verification(station)
         except Exception as e:
             print(f"Rollup error: {e}")
         time.sleep(REFRESH_SEC)
@@ -1325,6 +1449,32 @@ def api_history():
         station = "KOKC"
     history = load_json_file(f"{DATA_DIR}/history_{station}.json", {})
     return jsonify(history)
+
+@app.route("/api/projection_verification")
+def api_projection_verification():
+    """
+    Returns the day-by-day record of today_high_projection's final call vs the
+    actual observed high, plus today's live in-progress projection log.
+    """
+    station = request.args.get("station", "KOKC").upper()
+    if station not in STATIONS:
+        station = "KOKC"
+    verification = load_json_file(f"{DATA_DIR}/projection_verification_{station}.json", {})
+    today_str = station_local_now(station).strftime("%Y-%m-%d")
+    today_log = load_json_file(f"{DATA_DIR}/projection_log_{station}.json", {}).get(today_str, [])
+    days_sorted = sorted(verification.keys(), reverse=True)
+    errors = [verification[d]["error"] for d in days_sorted if verification[d].get("error") is not None]
+    summary = {
+        "days_recorded": len(days_sorted),
+        "mean_error": round(sum(errors) / len(errors), 2) if errors else None,
+        "mean_abs_error": round(sum(abs(e) for e in errors) / len(errors), 2) if errors else None,
+    }
+    return jsonify({
+        "station": station,
+        "summary": summary,
+        "history": [{"date": d, **verification[d]} for d in days_sorted],
+        "today_log": today_log,
+    })
 
 @app.route("/api/accuracy", methods=["POST"])
 def save_accuracy():
