@@ -483,6 +483,19 @@ def fetch_metar(station):
             sky_oktas = max_cover
         wind_dir_deg = m.get("wdir")
         wind_card = deg_to_cardinal(wind_dir_deg)
+
+        # Present weather (precip/obscuration) from aviationweather.gov's wxString,
+        # e.g. "-RA", "SHRA", "TSRA", "SN", "DZ". Used to gate the nowcast solar
+        # boost: active precip means no meaningful heating regardless of sky/wind,
+        # something oktas alone can't tell us (OVC with no rain vs. OVC raining
+        # look identical in the cover tier).
+        wx_string = (m.get("wxString") or "").strip()
+        PRECIP_CODES = ("RA", "SN", "DZ", "SG", "PL", "GR", "GS", "IC", "UP")
+        # Vicinity groups (VCSH, VCRA, etc.) mean precip within ~10mi, not at the
+        # station itself -- don't gate on those, only on precip actually reported.
+        wx_groups = [g for g in wx_string.split() if not g.startswith("VC")]
+        precip_active = any(code in g for g in wx_groups for code in PRECIP_CODES)
+
         return {
             "raw": m.get("rawOb", ""),
             "temp_c": _safe_float(m.get("temp")),
@@ -492,6 +505,8 @@ def fetch_metar(station):
             "sky_oktas": sky_oktas,
             "flight_category": m.get("fltcat", ""),
             "obs_time": m.get("obsTime", ""),
+            "wx_string": wx_string,
+            "precip_active": precip_active,
         }
     except Exception as e:
         return None
@@ -589,10 +604,19 @@ def compute_nowcast(station, st):
                     boost = b
                     break
 
+        # Active precip overrides everything below: rain/snow/etc. pins the
+        # surface near the wet-bulb temp and kills solar heating regardless of
+        # sky tier or wind direction. Oktas alone can't distinguish a dry OVC
+        # deck from one that's actively raining, so this checks METAR present
+        # weather directly rather than inferring it from cloud cover.
+        precip_active = bool(metar.get("precip_active"))
+        if precip_active:
+            boost = 0.0
+
         # Per-station wind direction factor
         wind_effect = "neutral"
         profile = STATION_WIND_PROFILE.get(station, {})
-        if wind_dir:
+        if not precip_active and wind_dir:
             if wind_dir in profile.get("suppress", []):
                 boost = 0.0
                 wind_effect = "suppress"
@@ -602,7 +626,7 @@ def compute_nowcast(station, st):
 
         # Wind speed continuous suppression (independent of direction effect)
         # Full boost calm -> zero boost at 25kt+
-        if wind_effect != "suppress":
+        if not precip_active and wind_effect != "suppress":
             speed_factor = max(0.0, 1.0 - (wind_kt / 25.0))
             boost = boost * speed_factor
 
@@ -637,6 +661,8 @@ def compute_nowcast(station, st):
             "wind_dir": wind_dir,
             "wind_kt": wind_kt,
             "sky_oktas": sky_oktas,
+            "precip_active": precip_active,
+            "wx_string": metar.get("wx_string") or "",
         }
     except Exception:
         return None
@@ -2022,6 +2048,7 @@ th.default-col{color:var(--orange) !important}
       <div class="sc"><div class="lbl">Flight Cat</div><div class="v" id="cond-fltcat" style="font-size:16px">--</div><div class="s">METAR</div></div>
       <div class="sc"><div class="lbl">Sky Cover</div><div class="v" id="cond-sky" style="font-size:16px">--</div><div class="s">oktas (METAR)</div></div>
       <div class="sc"><div class="lbl">Wind</div><div class="v" id="cond-wind" style="font-size:16px">--</div><div class="s" id="cond-wind-kt">-- kt</div></div>
+      <div class="sc"><div class="lbl">Wx</div><div class="v" id="cond-wx" style="font-size:16px">--</div><div class="s">present wx (METAR)</div></div>
       <div class="sc"><div class="lbl">Solar Noon Obs</div><div class="v" id="cond-noon-obs" style="color:var(--yellow);font-size:16px">--</div><div class="s" id="cond-noon-dt">--</div></div>
     </div>
     <div style="font-size:10px;color:var(--dimmer);margin-top:4px" id="cond-metar-raw"></div>
@@ -2758,7 +2785,9 @@ function render(data){
     var ncSc = document.getElementById("s-nowcast-sc");
     if(nc && nc.nowcast != null){
       var ncVal = nc.nowcast + "F";
-      var ncSub = "+" + nc.sky_boost + "F solar" + (nc.suppressed ? " (wind suppressed)" : "");
+      var ncSub = nc.precip_active
+        ? "+0F solar (precip: " + (nc.wx_string || "active") + ")"
+        : "+" + nc.sky_boost + "F solar" + (nc.wind_effect === "suppress" ? " (wind suppressed)" : "");
       var elSN = document.getElementById("s-nowcast"); if(elSN) elSN.textContent = ncVal;
       var elSS = document.getElementById("s-nowcast-sub"); if(elSS) elSS.textContent = ncSub;
       if(ncSc) ncSc.style.display = "block";
@@ -2832,6 +2861,11 @@ function render(data){
       if(elWind) elWind.textContent = metar.wind_dir || "--";
       var elKt = document.getElementById("cond-wind-kt");
       if(elKt) elKt.textContent = metar.wind_speed_kt != null ? metar.wind_speed_kt + " kt" : "-- kt";
+      var elWx = document.getElementById("cond-wx");
+      if(elWx){
+        elWx.textContent = metar.wx_string ? metar.wx_string : (metar.flight_category ? "none" : "--");
+        elWx.style.color = metar.precip_active ? "var(--red)" : "var(--text)";
+      }
       var elNoonObs = document.getElementById("cond-noon-obs");
       if(elNoonObs) elNoonObs.textContent = cond.solar_noon_obs != null ? cond.solar_noon_obs + "F" : "--";
       var elNoonDt = document.getElementById("cond-noon-dt");
