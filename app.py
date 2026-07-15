@@ -159,6 +159,21 @@ STATION_LON = {
     "KMSP": -93.2218,
     "KSAT": -98.4700,
 }
+STATION_LAT = {
+    "KOKC": 35.3931,
+    "KPHL": 39.8721,
+    "KDCA": 38.8512,
+    "KBOS": 42.3656,
+    "KDEN": 39.8561,
+    "KHOU": 29.6454,
+    "KLAS": 36.0840,
+    "KMDW": 41.7868,
+    "KMSP": 44.8848,
+    "KSAT": 29.5312,
+}
+NWS_USER_AGENT = "KalshiWeatherTracker/1.0 (personal use, not for redistribution)"
+# ^ NWS API requires a descriptive User-Agent identifying the app; no API key needed.
+# Replace with a contact email if you want to be fully compliant with their request.
 # Per-station wind profiles.
 # suppress: directions that reduce solar heating boost (factor 0.0)
 # enhance:  directions that increase solar heating (factor applied on top of sky boost)
@@ -253,6 +268,7 @@ def make_state():
     return {
         "obs": None,
         "wethr_high": None,
+        "nws_forecast": None,
         "forecasts": {},
         "nws_versions": {},
         "accuracy": {},
@@ -970,6 +986,66 @@ def compute_todaycast(station, st, consensus):
         "remaining_hours": proj.get("remaining_hours") if proj else None,
     }
 
+def get_nws_gridpoint(station):
+    """
+    Resolves and caches (station -> gridId/gridX/gridY/forecast_url) via the NWS
+    /points endpoint. This mapping is static per lat/lon, so it's cached to disk
+    instead of re-resolved every fetch -- NWS's API docs explicitly ask consumers
+    to cache this rather than hit /points repeatedly.
+    """
+    cache = load_json_file(f"{DATA_DIR}/nws_gridpoints.json", {})
+    if station in cache and cache[station].get("forecast_url"):
+        return cache[station]
+    lat = STATION_LAT.get(station)
+    lon = STATION_LON.get(station)
+    if lat is None or lon is None:
+        return None
+    headers = {"User-Agent": NWS_USER_AGENT, "Accept": "application/geo+json"}
+    r = requests.get(f"https://api.weather.gov/points/{lat},{lon}", headers=headers, timeout=10)
+    r.raise_for_status()
+    props = r.json().get("properties", {})
+    entry = {
+        "gridId": props.get("gridId"),
+        "gridX": props.get("gridX"),
+        "gridY": props.get("gridY"),
+        "forecast_url": props.get("forecast"),
+    }
+    cache[station] = entry
+    save_json_file(f"{DATA_DIR}/nws_gridpoints.json", cache)
+    return entry
+
+def fetch_nws_forecast(station="KOKC"):
+    """
+    Pulls the actual official NWS forecast (the real forecaster-issued high) via
+    api.weather.gov -- not a model, not wethr.net's own approximation of NWS
+    methodology. This is what Kalshi settles its weather markets against, so
+    it's the single most directly relevant reference point on the dashboard.
+    Free, no API key, no daily cap. Returns a dict or None on failure.
+    """
+    try:
+        gp = get_nws_gridpoint(station)
+        if not gp or not gp.get("forecast_url"):
+            return None
+        headers = {"User-Agent": NWS_USER_AGENT, "Accept": "application/geo+json"}
+        r = requests.get(gp["forecast_url"], headers=headers, timeout=10)
+        r.raise_for_status()
+        periods = r.json().get("properties", {}).get("periods", [])
+        if not periods:
+            return None
+        # The first daytime period is "today's high" in the NWS forecast product
+        # (periods alternate Day/Night: "Today"/"Tonight"/"Tomorrow"/etc.)
+        today_period = next((p for p in periods if p.get("isDaytime")), None)
+        if not today_period:
+            return None
+        return {
+            "high": today_period.get("temperature"),
+            "period_name": today_period.get("name"),
+            "short_forecast": today_period.get("shortForecast"),
+            "updated": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    except Exception:
+        return None
+
 def fetch_all(station="KOKC"):
     st = get_state(station)
     if not API_KEY:
@@ -1031,6 +1107,17 @@ def fetch_all(station="KOKC"):
     except Exception as e:
         errors.append(f"WethrHigh: {e}")
         add_log(f"Wethr High error: {e}", "err", station)
+
+    # Official NWS forecast (what Kalshi settles against) -- free API, no cap
+    try:
+        nws = fetch_nws_forecast(station)
+        st["nws_forecast"] = nws
+        if nws and nws.get("high") is not None:
+            add_log(f"NWS Forecast: {nws['high']}F ({nws.get('period_name')})", "ok", station)
+        else:
+            add_log("NWS Forecast: no data returned", "warn", station)
+    except Exception as e:
+        add_log(f"NWS Forecast error: {e}", "warn", station)
 
     fetch_targets = active_models(station)
     if not fetch_targets:
@@ -1562,6 +1649,7 @@ def api_state():
 
     return jsonify({
         "station": station, "obs": st["obs"], "wethr_high": st["wethr_high"],
+        "nws_forecast": st.get("nws_forecast"),
         "rows": rows, "consensus": consensus,
         "last_updated": st["last_updated"], "errors": st["errors"],
         "log": st["log"][:30], "models": active_models(station),
@@ -1809,6 +1897,12 @@ th.default-col{color:var(--orange) !important}
       <div class="sub2">NWS logic</div>
     </div>
     <div class="sp"></div>
+    <div class="stat-pill" id="h-nws-pill" style="display:none">
+      <div class="lbl">NWS Forecast</div>
+      <div class="val" id="h-nws" style="color:#38bdf8">--</div>
+      <div class="sub2" id="h-nws-sub">official</div>
+    </div>
+    <div class="sp"></div>
     <div class="stat-pill">
       <div class="lbl">Consensus</div>
       <div class="val" id="h-con" style="color:var(--blue)">--</div>
@@ -1855,6 +1949,7 @@ th.default-col{color:var(--orange) !important}
   <div class="srow">
     <div class="sc"><div class="lbl">Current Temp</div><div class="v" id="s-obs" style="color:var(--yellow)">--</div><div class="s" id="s-obs-t">awaiting</div></div>
     <div class="sc"><div class="lbl">Wethr High</div><div class="v" id="s-wh" style="color:var(--green)">--</div><div class="s">NWS trading day</div></div>
+    <div class="sc" id="s-nws-sc" style="display:none"><div class="lbl">NWS Forecast High</div><div class="v" id="s-nws" style="color:#38bdf8">--</div><div class="s" id="s-nws-sub">official, settles Kalshi</div></div>
     <div class="sc"><div class="lbl">Consensus High</div><div class="v" id="s-con" style="color:var(--blue)">--</div><div class="s">MAE-weighted adj</div></div>
     <div class="sc"><div class="lbl">Models Live</div><div class="v" id="s-mods" style="color:var(--purple)">--</div><div class="s">forecast runs</div></div>
     <div class="sc"><div class="lbl">Tmr Consensus</div><div class="v" id="s-tmr" style="color:#a78bfa">--</div><div class="s">MAE-weighted adj</div></div>
@@ -2139,7 +2234,7 @@ function updateStationButtons(){
 }
 
 function clearDisplay(){
-  ["h-obs","h-wh","h-con","h-tmr","s-obs","s-wh","s-con","s-tmr"].forEach(function(id){
+  ["h-obs","h-wh","h-con","h-tmr","s-obs","s-wh","s-con","s-tmr","h-nws","s-nws"].forEach(function(id){
     var el = document.getElementById(id); if(el) el.textContent="--";
   });
   ["h-obs-t","s-obs-t"].forEach(function(id){
@@ -2471,6 +2566,24 @@ function render(data){
     document.getElementById("pace-obs").textContent = t;
   }
   if(wh){ document.getElementById("h-wh").textContent=wh.wethr_high+"F"; document.getElementById("s-wh").textContent=wh.wethr_high+"F"; }
+  try {
+    var nwsF = data.nws_forecast;
+    var nwsPill = document.getElementById("h-nws-pill");
+    var nwsSc = document.getElementById("s-nws-sc");
+    if(nwsF && nwsF.high != null){
+      var nwsVal = nwsF.high + "F";
+      var nwsSub = nwsF.period_name || "official";
+      document.getElementById("h-nws").textContent = nwsVal;
+      document.getElementById("h-nws-sub").textContent = nwsSub;
+      document.getElementById("s-nws").textContent = nwsVal;
+      document.getElementById("s-nws-sub").textContent = nwsSub + " · settles Kalshi";
+      if(nwsPill) nwsPill.style.display = "block";
+      if(nwsSc) nwsSc.style.display = "block";
+    } else {
+      if(nwsPill) nwsPill.style.display = "none";
+      if(nwsSc) nwsSc.style.display = "none";
+    }
+  } catch(e){ console.error("NWS forecast render error", e); }
   if(con){ document.getElementById("h-con").textContent=con+"F"; document.getElementById("s-con").textContent=con+"F"; }
   var tmrCon = data.tmr_consensus;
   if(tmrCon){
