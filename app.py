@@ -854,11 +854,15 @@ def compute_today_high_projection(station="KOKC"):
 
 def log_projection_snapshot(station="KOKC"):
     """
-    Records the current today_high_projection result to disk, timestamped.
-    Called once per fetch_all cycle (auto or manual). This is the raw feed
-    for verification: it lets us see what the projection was saying at every
-    point through the day, not just the final number, so we can measure how
-    fast/well it converges toward the actual high as more obs come in.
+    Records the current today_high_projection result to disk, timestamped —
+    plus, alongside it, the TodayCast value, model consensus, and the weather
+    "regime" in effect at that moment (precip active, sky oktas, wind effect).
+    Called once per fetch_all cycle (auto or manual). This is the raw feed for
+    verification: it lets us see what each signal was saying at every point
+    through the day, not just the final number, so we can measure how fast/
+    well they converge toward the actual high as more obs come in -- and,
+    once enough days accrue, whether accuracy differs by regime (e.g. does
+    the precip gate actually shrink error on rainy days vs. clear ones).
     Silently skips logging when there's no valid projection yet (insufficient
     data, past peak window with no data, etc.) — nothing meaningful to record.
     """
@@ -866,37 +870,59 @@ def log_projection_snapshot(station="KOKC"):
         proj = compute_today_high_projection(station)
         if not proj or proj.get("error"):
             return
+        st = get_state(station)
+        consensus = None
+        todaycast = None
+        nowcast = None
+        try:
+            consensus = compute_consensus_only(station, st)
+        except Exception:
+            consensus = None
+        try:
+            nowcast = compute_nowcast(station, st)
+        except Exception:
+            nowcast = None
+        try:
+            tc = compute_todaycast(station, st, consensus)
+            todaycast = tc.get("todaycast") if tc else None
+        except Exception:
+            todaycast = None
+
         now_local = station_local_now(station)
         date_str = now_local.strftime("%Y-%m-%d")
         time_str = now_local.strftime("%H:%M")
         log_file = f"{DATA_DIR}/projection_log_{station}.json"
         disk = load_json_file(log_file, {})
         day = disk.setdefault(date_str, [])
+        entry = {
+            "time": time_str, "projected_high": proj.get("projected_high"),
+            "method": proj.get("method"), "obs_now": proj.get("obs_now"),
+            "rate_latest": proj.get("rate_latest"), "rate_prev": proj.get("rate_prev"),
+            "todaycast": todaycast, "consensus": consensus,
+            "precip_active": bool(nowcast.get("precip_active")) if nowcast else False,
+            "sky_oktas": nowcast.get("sky_oktas") if nowcast else None,
+            "wind_effect": nowcast.get("wind_effect") if nowcast else None,
+        }
         # Avoid double-logging if a fetch happens twice in the same minute
         if day and day[-1].get("time") == time_str:
-            day[-1] = {
-                "time": time_str, "projected_high": proj.get("projected_high"),
-                "method": proj.get("method"), "obs_now": proj.get("obs_now"),
-                "rate_latest": proj.get("rate_latest"), "rate_prev": proj.get("rate_prev"),
-            }
+            day[-1] = entry
         else:
-            day.append({
-                "time": time_str, "projected_high": proj.get("projected_high"),
-                "method": proj.get("method"), "obs_now": proj.get("obs_now"),
-                "rate_latest": proj.get("rate_latest"), "rate_prev": proj.get("rate_prev"),
-            })
+            day.append(entry)
         save_json_file(log_file, disk)
     except Exception as e:
         add_log(f"Projection log error: {e}", "warn", station)
 
 def rollup_projection_verification(station="KOKC"):
     """
-    Once a day has fully closed out, compares the day's final logged projection
-    against the actual observed high (max of that day's deduped obs samples)
-    and stores the result permanently. This is the dataset to eventually spot
-    systemic bias (e.g. "projections consistently run 2F hot") and recalibrate
-    TYPICAL_PEAK_LAG_HOURS / MAX_BRIDGE_ADDED_F / etc. against real outcomes
-    instead of guessing at constants.
+    Once a day has fully closed out, compares the day's final logged values
+    (projection, TodayCast, and raw model consensus) against the actual
+    observed high, and stores the result permanently — along with whether
+    precip ever gated the nowcast boost that day and the closing sky/wind
+    regime. This is the dataset to eventually spot systemic bias (e.g.
+    "projections consistently run 2F hot" or "TodayCast is worse than plain
+    consensus on precip days") and recalibrate constants like
+    TYPICAL_PEAK_LAG_HOURS, or the precip gate itself, against real outcomes
+    instead of guessing.
     """
     now = station_local_now(station)
     yesterday = (now - timedelta(days=1)).strftime("%Y-%m-%d")
@@ -922,12 +948,30 @@ def rollup_projection_verification(station="KOKC"):
     final_proj = final.get("projected_high")
     error = round(final_proj - actual_high, 1) if final_proj is not None else None
 
+    final_todaycast = final.get("todaycast")
+    error_todaycast = round(final_todaycast - actual_high, 1) if final_todaycast is not None else None
+    final_consensus = final.get("consensus")
+    error_consensus = round(final_consensus - actual_high, 1) if final_consensus is not None else None
+
+    # Regime tags for this day, for slicing accuracy by weather pattern later:
+    # any_precip_gate = the boost was zeroed by active precip at some point;
+    # final sky/wind = conditions at the day's last logged snapshot (closest
+    # to the actual peak-heating window).
+    any_precip_gate = any(e.get("precip_active") for e in day_log)
+
     ver[yesterday] = {
         "actual_high": actual_high,
         "final_projection": final_proj,
         "final_method": final.get("method"),
         "final_projection_time": final.get("time"),
         "error": error,
+        "final_todaycast": final_todaycast,
+        "error_todaycast": error_todaycast,
+        "final_consensus": final_consensus,
+        "error_consensus": error_consensus,
+        "any_precip_gate": any_precip_gate,
+        "final_sky_oktas": final.get("sky_oktas"),
+        "final_wind_effect": final.get("wind_effect"),
         "first_projection": first.get("projected_high"),
         "first_projection_time": first.get("time"),
         "projection_count": len(day_log),
@@ -935,7 +979,9 @@ def rollup_projection_verification(station="KOKC"):
     save_json_file(ver_file, ver)
     add_log(
         f"Projection verification for {yesterday}: actual={actual_high}F "
-        f"final_proj={final_proj}F error={error}",
+        f"final_proj={final_proj}F error={error} "
+        f"todaycast_err={error_todaycast} consensus_err={error_consensus} "
+        f"precip_gate={any_precip_gate}",
         "ok", station
     )
 
@@ -1224,6 +1270,19 @@ def fetch_all(station="KOKC"):
     except Exception as e:
         add_log(f"Snapshot error: {e}", "warn", station)
 
+    # METAR fetch — uses aviationweather.gov (free), NOT wethr_get, cannot touch
+    # daily cap. Runs before log_projection_snapshot() so its precip/sky/wind
+    # regime tags reflect this cycle's conditions, not the previous fetch's.
+    try:
+        metar = fetch_metar(station)
+        if metar:
+            st["metar"] = metar
+            add_log(f"METAR: sky={metar.get('sky_oktas')} oktas wind={metar.get('wind_dir')} cat={metar.get('flight_category')}", "info", station)
+        else:
+            add_log("METAR: no data returned (non-fatal)", "warn", station)
+    except Exception as e:
+        add_log(f"METAR fetch error (non-fatal): {e}", "warn", station)
+
     try:
         log_projection_snapshot(station)
     except Exception as e:
@@ -1235,17 +1294,6 @@ def fetch_all(station="KOKC"):
             save_consensus_snapshot(station)
     except Exception as e:
         add_log(f"Consensus snapshot error: {e}", "warn", station)
-
-    # METAR fetch — uses aviationweather.gov (free), NOT wethr_get, cannot touch daily cap
-    try:
-        metar = fetch_metar(station)
-        if metar:
-            st["metar"] = metar
-            add_log(f"METAR: sky={metar.get('sky_oktas')} oktas wind={metar.get('wind_dir')} cat={metar.get('flight_category')}", "info", station)
-        else:
-            add_log("METAR: no data returned (non-fatal)", "warn", station)
-    except Exception as e:
-        add_log(f"METAR fetch error (non-fatal): {e}", "warn", station)
 
 
 _memory_snapshots = {}
@@ -1470,13 +1518,15 @@ def weighted_consensus(items, decimals=1):
 
     return round(w_sum / w_total, decimals) if w_total > 0 else None
 
-def save_consensus_snapshot(station="KOKC"):
-    st = get_state(station)
-    now = station_local_now(station)
-    if now.hour < 6 or now.hour >= 22:
-        return
-    date_str = now.strftime("%Y-%m-%d")
-    time_str = now.strftime("%H:%M")
+def _build_consensus_items(station, st):
+    """
+    Shared item-builder for weighted_consensus(): for each active model, applies
+    the run-specific (falling back to default, then overall) bias correction to
+    its raw forecast and pairs it with that model's MAE/RMSE/run for weighting.
+    Extracted so save_consensus_snapshot() (persisted twice-hourly history) and
+    compute_consensus_only() (every-cycle logging for verification) always run
+    the exact same math instead of two copies drifting apart over time.
+    """
     acc = st.get("accuracy", {})
     forecasts = st.get("forecasts", {})
     models = [m for m in acc.keys() if m != "NWS"]
@@ -1510,6 +1560,27 @@ def save_consensus_snapshot(station="KOKC"):
             if pace is not None:
                 pace_items.append({"value": pace, "mae": mae_val, "rmse": rmse_val, "run": current_run})
         except: pass
+    return cons_items, pace_items
+
+def compute_consensus_only(station, st):
+    """
+    Lightweight consensus getter: same weighting math as save_consensus_snapshot,
+    but callable every fetch cycle (no twice-an-hour persistence gate, no disk
+    write). Used to feed compute_todaycast() during per-cycle verification
+    logging, so the logged TodayCast matches what a user would have seen on
+    the dashboard at that moment.
+    """
+    cons_items, _ = _build_consensus_items(station, st)
+    return weighted_consensus(cons_items)
+
+def save_consensus_snapshot(station="KOKC"):
+    st = get_state(station)
+    now = station_local_now(station)
+    if now.hour < 6 or now.hour >= 22:
+        return
+    date_str = now.strftime("%Y-%m-%d")
+    time_str = now.strftime("%H:%M")
+    cons_items, pace_items = _build_consensus_items(station, st)
     consensus = weighted_consensus(cons_items)
     cons_pace = weighted_consensus(pace_items, decimals=2)
     implied = round(consensus + cons_pace, 1) if consensus is not None and cons_pace is not None else None
@@ -1703,8 +1774,12 @@ def api_history():
 @app.route("/api/projection_verification")
 def api_projection_verification():
     """
-    Returns the day-by-day record of today_high_projection's final call vs the
-    actual observed high, plus today's live in-progress projection log.
+    Returns the day-by-day record of today_high_projection/TodayCast/consensus
+    final calls vs the actual observed high, plus today's live in-progress
+    projection log. The summary includes a precip-gate regime split so you can
+    see directly whether days the nowcast boost got zeroed by active precip
+    are tracking better or worse than clear/dry days -- the actual answer to
+    "is the precip gate helping."
     """
     station = request.args.get("station", "KOKC").upper()
     if station not in STATIONS:
@@ -1713,15 +1788,43 @@ def api_projection_verification():
     today_str = station_local_now(station).strftime("%Y-%m-%d")
     today_log = load_json_file(f"{DATA_DIR}/projection_log_{station}.json", {}).get(today_str, [])
     days_sorted = sorted(verification.keys(), reverse=True)
+
+    def _abs_err_stats(vals):
+        vals = [v for v in vals if v is not None]
+        if not vals:
+            return {"days": 0, "mean_error": None, "mean_abs_error": None}
+        return {
+            "days": len(vals),
+            "mean_error": round(sum(vals) / len(vals), 2),
+            "mean_abs_error": round(sum(abs(v) for v in vals) / len(vals), 2),
+        }
+
     errors = [verification[d]["error"] for d in days_sorted if verification[d].get("error") is not None]
     summary = {
         "days_recorded": len(days_sorted),
         "mean_error": round(sum(errors) / len(errors), 2) if errors else None,
         "mean_abs_error": round(sum(abs(e) for e in errors) / len(errors), 2) if errors else None,
     }
+
+    # TodayCast accuracy split by whether precip gated the nowcast boost that
+    # day. This is the direct before/after-style comparison for the precip
+    # gate: once both buckets have enough days, precip-gate mean_abs_error
+    # should sit closer to the clear-day figure than it used to.
+    tc_precip = [verification[d].get("error_todaycast") for d in days_sorted if verification[d].get("any_precip_gate")]
+    tc_clear = [verification[d].get("error_todaycast") for d in days_sorted if verification[d].get("any_precip_gate") is False]
+    cons_precip = [verification[d].get("error_consensus") for d in days_sorted if verification[d].get("any_precip_gate")]
+    cons_clear = [verification[d].get("error_consensus") for d in days_sorted if verification[d].get("any_precip_gate") is False]
+    regime_summary = {
+        "todaycast_precip_gate_days": _abs_err_stats(tc_precip),
+        "todaycast_clear_days": _abs_err_stats(tc_clear),
+        "consensus_precip_gate_days": _abs_err_stats(cons_precip),
+        "consensus_clear_days": _abs_err_stats(cons_clear),
+    }
+
     return jsonify({
         "station": station,
         "summary": summary,
+        "regime_summary": regime_summary,
         "history": [{"date": d, **verification[d]} for d in days_sorted],
         "today_log": today_log,
     })
