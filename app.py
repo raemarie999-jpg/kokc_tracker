@@ -872,12 +872,16 @@ def log_projection_snapshot(station="KOKC"):
             return
         st = get_state(station)
         consensus = None
+        spread = None
         todaycast = None
         nowcast = None
         try:
-            consensus = compute_consensus_only(station, st)
+            cons_items, _ = _build_consensus_items(station, st)
+            consensus = weighted_consensus(cons_items)
+            spread = consensus_spread(cons_items)
         except Exception:
             consensus = None
+            spread = None
         try:
             nowcast = compute_nowcast(station, st)
         except Exception:
@@ -898,7 +902,7 @@ def log_projection_snapshot(station="KOKC"):
             "time": time_str, "projected_high": proj.get("projected_high"),
             "method": proj.get("method"), "obs_now": proj.get("obs_now"),
             "rate_latest": proj.get("rate_latest"), "rate_prev": proj.get("rate_prev"),
-            "todaycast": todaycast, "consensus": consensus,
+            "todaycast": todaycast, "consensus": consensus, "consensus_spread": spread,
             "precip_active": bool(nowcast.get("precip_active")) if nowcast else False,
             "sky_oktas": nowcast.get("sky_oktas") if nowcast else None,
             "wind_effect": nowcast.get("wind_effect") if nowcast else None,
@@ -1518,14 +1522,60 @@ def weighted_consensus(items, decimals=1):
 
     return round(w_sum / w_total, decimals) if w_total > 0 else None
 
+def consensus_spread(items):
+    """
+    Spread (max - min) of the same MAD-filtered value set weighted_consensus()
+    uses internally for its blend -- a tight spread means the model pack is in
+    real agreement (higher confidence in the consensus number); a wide spread
+    means meaningful disagreement even after outlier-gating (lower confidence).
+    Useful as a position-sizing signal independent of the consensus value itself.
+
+    Deliberately a separate function rather than a second return value from
+    weighted_consensus(): that function's return type (plain float|None) is
+    depended on by every call site as-is, so this re-derives the same
+    median/MAD filter rather than risk changing weighted_consensus()'s
+    signature. If the filter logic in weighted_consensus() ever changes,
+    update this to match.
+
+    items: same shape as weighted_consensus() takes.
+    Returns rounded float or None if nothing valid.
+    """
+    valid = []
+    for it in items:
+        try:
+            v = float(it.get("value"))
+            mae = float(it.get("mae") or 0)
+            if mae <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        valid.append(v)
+
+    if not valid:
+        return None
+
+    n = len(valid)
+    vals = sorted(valid)
+    median = vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+    devs = sorted(abs(v - median) for v in vals)
+    mad = devs[n // 2] if n % 2 else (devs[n // 2 - 1] + devs[n // 2]) / 2
+    mad = max(mad, 1.0)
+
+    filtered = [v for v in vals if abs(v - median) <= 3 * mad] if n >= 4 else vals
+    if not filtered:
+        filtered = vals
+
+    return round(max(filtered) - min(filtered), 1)
+
 def _build_consensus_items(station, st):
     """
-    Shared item-builder for weighted_consensus(): for each active model, applies
-    the run-specific (falling back to default, then overall) bias correction to
-    its raw forecast and pairs it with that model's MAE/RMSE/run for weighting.
-    Extracted so save_consensus_snapshot() (persisted twice-hourly history) and
-    compute_consensus_only() (every-cycle logging for verification) always run
-    the exact same math instead of two copies drifting apart over time.
+    Shared item-builder for weighted_consensus()/consensus_spread(): for each
+    active model, applies the run-specific (falling back to default, then
+    overall) bias correction to its raw forecast and pairs it with that
+    model's MAE/RMSE/run for weighting. Extracted so save_consensus_snapshot()
+    (persisted twice-hourly history) and log_projection_snapshot() (every-cycle
+    verification logging) always run the exact same math instead of two
+    copies drifting apart over time.
     """
     acc = st.get("accuracy", {})
     forecasts = st.get("forecasts", {})
@@ -1566,9 +1616,10 @@ def compute_consensus_only(station, st):
     """
     Lightweight consensus getter: same weighting math as save_consensus_snapshot,
     but callable every fetch cycle (no twice-an-hour persistence gate, no disk
-    write). Used to feed compute_todaycast() during per-cycle verification
-    logging, so the logged TodayCast matches what a user would have seen on
-    the dashboard at that moment.
+    write). Not currently called internally (log_projection_snapshot calls
+    _build_consensus_items directly so it can get spread in the same pass) —
+    kept as a convenience for any future one-off consensus lookup that doesn't
+    need spread.
     """
     cons_items, _ = _build_consensus_items(station, st)
     return weighted_consensus(cons_items)
@@ -1699,6 +1750,7 @@ def api_state():
                 cons_items.append({"value": float(adj), "mae": mae, "rmse": r.get("rmse"), "run": r.get("run")})
         except: pass
     consensus = weighted_consensus(cons_items)
+    spread = consensus_spread(cons_items)
 
     pace_items = []
     for r in rows:
@@ -1747,7 +1799,7 @@ def api_state():
     return jsonify({
         "station": station, "obs": st["obs"], "wethr_high": st["wethr_high"],
         "nws_forecast": st.get("nws_forecast"),
-        "rows": rows, "consensus": consensus,
+        "rows": rows, "consensus": consensus, "consensus_spread": spread,
         "last_updated": st["last_updated"], "errors": st["errors"],
         "log": st["log"][:30], "models": active_models(station),
         "nws_versions": st["nws_versions"],
@@ -2079,7 +2131,7 @@ th.default-col{color:var(--orange) !important}
     <div class="sc"><div class="lbl">Current Temp</div><div class="v" id="s-obs" style="color:var(--yellow)">--</div><div class="s" id="s-obs-t">awaiting</div></div>
     <div class="sc"><div class="lbl">Wethr High</div><div class="v" id="s-wh" style="color:var(--green)">--</div><div class="s">NWS trading day</div></div>
     <div class="sc" id="s-nws-sc" style="display:none"><div class="lbl">NWS Forecast High</div><div class="v" id="s-nws" style="color:#38bdf8">--</div><div class="s" id="s-nws-sub">official, settles Kalshi</div></div>
-    <div class="sc"><div class="lbl">Consensus High</div><div class="v" id="s-con" style="color:var(--blue)">--</div><div class="s">MAE-weighted adj</div></div>
+    <div class="sc"><div class="lbl">Consensus High</div><div class="v" id="s-con" style="color:var(--blue)">--</div><div class="s" id="s-con-sub">MAE-weighted adj</div></div>
     <div class="sc"><div class="lbl">Models Live</div><div class="v" id="s-mods" style="color:var(--purple)">--</div><div class="s">forecast runs</div></div>
     <div class="sc"><div class="lbl">Tmr Consensus</div><div class="v" id="s-tmr" style="color:#a78bfa">--</div><div class="s">MAE-weighted adj</div></div>
     <div class="sc" id="s-todaycast-sc" style="display:none"><div class="lbl">TodayCast</div><div class="v" id="s-todaycast" style="color:var(--orange)">--</div><div class="s" id="s-todaycast-sub">blended</div></div>
@@ -2715,6 +2767,18 @@ function render(data){
     }
   } catch(e){ console.error("NWS forecast render error", e); }
   if(con){ document.getElementById("h-con").textContent=con+"F"; document.getElementById("s-con").textContent=con+"F"; }
+  var conSub = document.getElementById("s-con-sub");
+  if(conSub){
+    var sp = data.consensus_spread;
+    if(sp != null){
+      conSub.textContent = "spread " + sp + "F (MAE-weighted adj)";
+      // Rough eyeball bands: <=2F tight agreement, <=4F normal, >4F wide disagreement
+      conSub.style.color = sp <= 2 ? "var(--green)" : (sp <= 4 ? "var(--dim)" : "var(--red)");
+    } else {
+      conSub.textContent = "MAE-weighted adj";
+      conSub.style.color = "var(--dim)";
+    }
+  }
   var tmrCon = data.tmr_consensus;
   if(tmrCon){
     document.getElementById("h-tmr").textContent=tmrCon+"F";
