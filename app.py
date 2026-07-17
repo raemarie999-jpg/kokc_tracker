@@ -134,6 +134,29 @@ _SKY_BOOST = [
     (5, 6,  0.5),   # BKN        (5-6 oktas): small boost
     (7, 8,  0.0),   # OVC/OVX    (7-8 oktas): no boost
 ]
+
+# Fraction of the solar boost retained the day after measurable precip, on an
+# otherwise-clear/dry day. Near-surface moisture left behind by rain tempers
+# daytime heating even once skies clear, since incoming solar energy goes
+# partly into evaporating that moisture rather than raising air temp. 0.75 is
+# a starting estimate, not a derived constant -- app_32_v8 adds the logging
+# needed to check/recalibrate this against actual outcomes once enough
+# precip-then-clear day pairs accrue in projection_verification.
+ANTECEDENT_MOISTURE_FACTOR = 0.75
+
+# Cloud-base height thresholds (ft AGL, from aviationweather.gov METAR JSON's
+# "base" field) used to discount the sky-tier boost suppression above. Oktas
+# alone can't distinguish a low stratus deck (near-total heating cap) from
+# high cirrus at the same coverage tier (largely transparent to solar). Only
+# matters when the sky tier itself already suppressed the boost (oktas >= 3)
+# -- CLR/FEW already gets full boost regardless of height. Thresholds are
+# standard low/mid/high cloud-base conventions, not station-specific.
+HIGH_CLOUD_BASE_FT = 20000   # cirrus/cirrostratus and above
+MID_CLOUD_BASE_FT = 6500     # altocumulus/altostratus
+# Multiplier applied to restore boost when the suppressing layer is elevated.
+# Starting estimates like ANTECEDENT_MOISTURE_FACTOR -- v9 logs
+# cloud_height_tier per cycle so these can be checked/recalibrated later.
+CLOUD_HEIGHT_RESTORE = {"high": 1.6, "mid": 1.25, "low": 1.0}
 # Station coordinates for solar elevation calculation
 STATION_LAT = {
     "KOKC": 35.3931,
@@ -469,16 +492,22 @@ def fetch_metar(station):
         if not data or not isinstance(data, list):
             return None
         m = data[0]
-        # Sky cover: take the highest BKN/OVC/OVX layer, else highest SCT/FEW
+        # Sky cover: take the highest BKN/OVC/OVX layer, else highest SCT/FEW.
+        # Also capture that layer's base height (ft AGL) -- oktas alone can't
+        # distinguish low stratus from high cirrus at the same coverage tier,
+        # but they have very different effects on solar heating (see
+        # cloud_height_tier in compute_nowcast).
         sky_oktas = None
         sky_layers = m.get("clouds") or []
         cover_map = {"CLR": 0, "SKC": 0, "FEW": 1, "SCT": 3, "BKN": 5, "OVC": 7, "OVX": 8}
         max_cover = -1
+        sky_base_ft = None
         for layer in sky_layers:
             cov = layer.get("cover", "")
             val = cover_map.get(cov, -1)
             if val > max_cover:
                 max_cover = val
+                sky_base_ft = _safe_float(layer.get("base"))
         if max_cover >= 0:
             sky_oktas = max_cover
         wind_dir_deg = m.get("wdir")
@@ -503,6 +532,7 @@ def fetch_metar(station):
             "wind_dir_deg": _safe_float(wind_dir_deg),
             "wind_speed_kt": _safe_float(m.get("wspd")),
             "sky_oktas": sky_oktas,
+            "sky_base_ft": sky_base_ft,
             "flight_category": m.get("fltcat", ""),
             "obs_time": m.get("obsTime", ""),
             "wx_string": wx_string,
@@ -543,6 +573,31 @@ def solar_elevation_deg(station, dt_utc):
     return math.degrees(math.asin(max(-1.0, min(1.0, sin_elev))))
 
 NOWCAST_EMA_ALPHA = 0.35  # weight given to the newest reading; lower = smoother/slower to react
+
+def had_recent_precip(station, st, days_back=1):
+    """
+    True if precip was active (compute_nowcast's precip_active flag) at any
+    logged point on a prior day within days_back. Feeds the antecedent-
+    moisture adjustment: near-surface moisture from a recent rain day tempers
+    the following day's heating even under clear skies.
+
+    Reads the projection_log that log_projection_snapshot() (v6) already
+    writes every fetch cycle -- no new persistence needed. This means it only
+    has real data from the day after v6 went live onward; for any day with no
+    logged entries (feature not live yet, gap in logging, etc.) this returns
+    False -- no adjustment -- rather than guessing.
+    """
+    try:
+        log_disk = load_json_file(f"{DATA_DIR}/projection_log_{station}.json", {})
+        now_local = station_local_now(station)
+        for d in range(1, days_back + 1):
+            date_str = (now_local - timedelta(days=d)).strftime("%Y-%m-%d")
+            day_log = log_disk.get(date_str, [])
+            if any(e.get("precip_active") for e in day_log):
+                return True
+        return False
+    except Exception:
+        return False
 
 def compute_nowcast(station, st):
     """
@@ -604,6 +659,23 @@ def compute_nowcast(station, st):
                     boost = b
                     break
 
+        # Cloud-height discount: restore boost when the layer suppressing it
+        # is elevated (cirrus/altostratus barely block the sun vs. low
+        # stratus). Only applies when sky already suppressed boost (oktas>=3)
+        # and a base height is available; unknown height makes no adjustment
+        # -- conservative default, treats it as low/full-cap rather than
+        # assuming high and over-restoring.
+        cloud_height_tier = None
+        sky_base_ft = metar.get("sky_base_ft")
+        if sky_oktas is not None and sky_oktas >= 3 and sky_base_ft is not None:
+            if sky_base_ft >= HIGH_CLOUD_BASE_FT:
+                cloud_height_tier = "high"
+            elif sky_base_ft >= MID_CLOUD_BASE_FT:
+                cloud_height_tier = "mid"
+            else:
+                cloud_height_tier = "low"
+            boost = min(boost * CLOUD_HEIGHT_RESTORE.get(cloud_height_tier, 1.0), 3.0)
+
         # Active precip overrides everything below: rain/snow/etc. pins the
         # surface near the wet-bulb temp and kills solar heating regardless of
         # sky tier or wind direction. Oktas alone can't distinguish a dry OVC
@@ -629,6 +701,18 @@ def compute_nowcast(station, st):
         if not precip_active and wind_effect != "suppress":
             speed_factor = max(0.0, 1.0 - (wind_kt / 25.0))
             boost = boost * speed_factor
+
+        # Antecedent-moisture adjustment: rain on a prior day leaves residual
+        # near-surface moisture that tempers heating the following day even
+        # once skies clear, since some incoming solar energy evaporates that
+        # moisture instead of raising air temp. Only meaningful when today
+        # isn't itself already zeroed out by active precip or a wind-suppress
+        # direction -- those cases already have boost = 0, nothing to reduce.
+        antecedent_moisture = False
+        if not precip_active and wind_effect != "suppress":
+            antecedent_moisture = had_recent_precip(station, st, days_back=1)
+            if antecedent_moisture:
+                boost = round(boost * ANTECEDENT_MOISTURE_FACTOR, 3)
 
         scaled_boost_raw = round(boost * time_factor, 2)
 
@@ -661,7 +745,10 @@ def compute_nowcast(station, st):
             "wind_dir": wind_dir,
             "wind_kt": wind_kt,
             "sky_oktas": sky_oktas,
+            "sky_base_ft": sky_base_ft,
+            "cloud_height_tier": cloud_height_tier,
             "precip_active": precip_active,
+            "antecedent_moisture": antecedent_moisture,
             "wx_string": metar.get("wx_string") or "",
         }
     except Exception:
@@ -904,8 +991,10 @@ def log_projection_snapshot(station="KOKC"):
             "rate_latest": proj.get("rate_latest"), "rate_prev": proj.get("rate_prev"),
             "todaycast": todaycast, "consensus": consensus, "consensus_spread": spread,
             "precip_active": bool(nowcast.get("precip_active")) if nowcast else False,
+            "antecedent_moisture": bool(nowcast.get("antecedent_moisture")) if nowcast else False,
             "sky_oktas": nowcast.get("sky_oktas") if nowcast else None,
             "wind_effect": nowcast.get("wind_effect") if nowcast else None,
+            "cloud_height_tier": nowcast.get("cloud_height_tier") if nowcast else None,
         }
         # Avoid double-logging if a fetch happens twice in the same minute
         if day and day[-1].get("time") == time_str:
@@ -959,9 +1048,11 @@ def rollup_projection_verification(station="KOKC"):
 
     # Regime tags for this day, for slicing accuracy by weather pattern later:
     # any_precip_gate = the boost was zeroed by active precip at some point;
-    # final sky/wind = conditions at the day's last logged snapshot (closest
-    # to the actual peak-heating window).
+    # any_antecedent_moisture = the day-after-rain suppression factor applied
+    # at some point; final sky/wind = conditions at the day's last logged
+    # snapshot (closest to the actual peak-heating window).
     any_precip_gate = any(e.get("precip_active") for e in day_log)
+    any_antecedent_moisture = any(e.get("antecedent_moisture") for e in day_log)
 
     ver[yesterday] = {
         "actual_high": actual_high,
@@ -974,8 +1065,10 @@ def rollup_projection_verification(station="KOKC"):
         "final_consensus": final_consensus,
         "error_consensus": error_consensus,
         "any_precip_gate": any_precip_gate,
+        "any_antecedent_moisture": any_antecedent_moisture,
         "final_sky_oktas": final.get("sky_oktas"),
         "final_wind_effect": final.get("wind_effect"),
+        "final_cloud_height_tier": final.get("cloud_height_tier"),
         "first_projection": first.get("projected_high"),
         "first_projection_time": first.get("time"),
         "projection_count": len(day_log),
@@ -1866,11 +1959,38 @@ def api_projection_verification():
     tc_clear = [verification[d].get("error_todaycast") for d in days_sorted if verification[d].get("any_precip_gate") is False]
     cons_precip = [verification[d].get("error_consensus") for d in days_sorted if verification[d].get("any_precip_gate")]
     cons_clear = [verification[d].get("error_consensus") for d in days_sorted if verification[d].get("any_precip_gate") is False]
+
+    # TodayCast accuracy split by the antecedent-moisture adjustment, using
+    # precip-free days on both sides so this isolates the "day after rain"
+    # effect from the (already-measured) precip-gate effect itself. This is
+    # the dataset to eventually check whether ANTECEDENT_MOISTURE_FACTOR
+    # (currently a 0.75 starting estimate) is roughly right, too aggressive,
+    # or too weak.
+    tc_ante = [verification[d].get("error_todaycast") for d in days_sorted
+               if verification[d].get("any_antecedent_moisture") and verification[d].get("any_precip_gate") is False]
+    tc_dry = [verification[d].get("error_todaycast") for d in days_sorted
+              if verification[d].get("any_antecedent_moisture") is False and verification[d].get("any_precip_gate") is False]
+
+    # TodayCast accuracy split by cloud height, restricted to days where the
+    # closing sky tier was actually suppressing the boost (final_cloud_height_tier
+    # is only set when oktas>=3 -- see compute_nowcast). This is the dataset
+    # to check whether CLOUD_HEIGHT_RESTORE's high/mid multipliers (currently
+    # 1.6/1.25 starting estimates) are actually closing the gap on high-cloud
+    # days vs leaving them under- or over-restored.
+    tc_high_cloud = [verification[d].get("error_todaycast") for d in days_sorted
+                      if verification[d].get("final_cloud_height_tier") == "high"]
+    tc_low_mid_cloud = [verification[d].get("error_todaycast") for d in days_sorted
+                         if verification[d].get("final_cloud_height_tier") in ("low", "mid")]
+
     regime_summary = {
         "todaycast_precip_gate_days": _abs_err_stats(tc_precip),
         "todaycast_clear_days": _abs_err_stats(tc_clear),
         "consensus_precip_gate_days": _abs_err_stats(cons_precip),
         "consensus_clear_days": _abs_err_stats(cons_clear),
+        "todaycast_antecedent_moisture_days": _abs_err_stats(tc_ante),
+        "todaycast_dry_days": _abs_err_stats(tc_dry),
+        "todaycast_high_cloud_days": _abs_err_stats(tc_high_cloud),
+        "todaycast_low_mid_cloud_days": _abs_err_stats(tc_low_mid_cloud),
     }
 
     return jsonify({
@@ -2952,9 +3072,17 @@ function render(data){
     var ncSc = document.getElementById("s-nowcast-sc");
     if(nc && nc.nowcast != null){
       var ncVal = nc.nowcast + "F";
-      var ncSub = nc.precip_active
-        ? "+0F solar (precip: " + (nc.wx_string || "active") + ")"
-        : "+" + nc.sky_boost + "F solar" + (nc.wind_effect === "suppress" ? " (wind suppressed)" : "");
+      var ncSub;
+      if(nc.precip_active){
+        ncSub = "+0F solar (precip: " + (nc.wx_string || "active") + ")";
+      } else {
+        var ncNotes = [];
+        if(nc.wind_effect === "suppress") ncNotes.push("wind suppressed");
+        if(nc.antecedent_moisture) ncNotes.push("prior-day moisture");
+        if(nc.cloud_height_tier === "high") ncNotes.push("high cloud");
+        else if(nc.cloud_height_tier === "mid") ncNotes.push("mid cloud");
+        ncSub = "+" + nc.sky_boost + "F solar" + (ncNotes.length ? " (" + ncNotes.join(", ") + ")" : "");
+      }
       var elSN = document.getElementById("s-nowcast"); if(elSN) elSN.textContent = ncVal;
       var elSS = document.getElementById("s-nowcast-sub"); if(elSS) elSS.textContent = ncSub;
       if(ncSc) ncSc.style.display = "block";
