@@ -157,6 +157,11 @@ MID_CLOUD_BASE_FT = 6500     # altocumulus/altostratus
 # Starting estimates like ANTECEDENT_MOISTURE_FACTOR -- v9 logs
 # cloud_height_tier per cycle so these can be checked/recalibrated later.
 CLOUD_HEIGHT_RESTORE = {"high": 1.6, "mid": 1.25, "low": 1.0}
+
+# Minimum closed-out days a regime bucket needs before its residual (see
+# compute_regime_residuals below) is treated as a real signal rather than
+# noise from a handful of days.
+MIN_REGIME_DAYS = 7
 # Station coordinates for solar elevation calculation
 STATION_LAT = {
     "KOKC": 35.3931,
@@ -1916,6 +1921,46 @@ def api_history():
     history = load_json_file(f"{DATA_DIR}/history_{station}.json", {})
     return jsonify(history)
 
+def compute_regime_residuals(station):
+    """
+    INFORMATIONAL ONLY -- this value is never applied to TodayCast, consensus,
+    or any other live number. It's displayed on the dashboard so it can be
+    watched over time before anything is ever built to act on it.
+
+    Computes the mean signed TodayCast error (error_todaycast) on days
+    any_precip_gate fired, straight from the app's own closed-out
+    verification history (projection_verification_{station}.json, built by
+    the v6 rollup) -- no manual data entry involved. This is the residual
+    left over even after the v5 precip gate already ran: e.g. mean_error
+    +0.8 means TodayCast is still running 0.8F warm on precip-gate days on
+    average, which would be the signal that the gate is under-correcting
+    (or, if consistently negative, over-correcting) for that regime.
+
+    Starts with a single bucket (any_precip_gate) rather than combinatorial
+    regime splits, since finer buckets would each take much longer to reach
+    MIN_REGIME_DAYS. Returns sufficient=False (and no mean_error) until
+    enough days have accrued -- deliberately doesn't offer a noisy number
+    early just because a few days happen to be available.
+    """
+    ver = load_json_file(f"{DATA_DIR}/projection_verification_{station}.json", {})
+    precip_errors = [
+        v.get("error_todaycast") for v in ver.values()
+        if v.get("any_precip_gate") and v.get("error_todaycast") is not None
+    ]
+    n = len(precip_errors)
+    result = {
+        "bucket": "precip_gate_days",
+        "n": n,
+        "min_days": MIN_REGIME_DAYS,
+        "sufficient": n >= MIN_REGIME_DAYS,
+        "mean_error": None,
+        "mean_abs_error": None,
+    }
+    if n > 0:
+        result["mean_error"] = round(sum(precip_errors) / n, 2)
+        result["mean_abs_error"] = round(sum(abs(e) for e in precip_errors) / n, 2)
+    return result
+
 @app.route("/api/projection_verification")
 def api_projection_verification():
     """
@@ -1997,6 +2042,7 @@ def api_projection_verification():
         "station": station,
         "summary": summary,
         "regime_summary": regime_summary,
+        "regime_residual": compute_regime_residuals(station),
         "history": [{"date": d, **verification[d]} for d in days_sorted],
         "today_log": today_log,
     })
@@ -2327,6 +2373,7 @@ th.default-col{color:var(--orange) !important}
       <div class="sc"><div class="lbl">Solar Noon Obs</div><div class="v" id="cond-noon-obs" style="color:var(--yellow);font-size:16px">--</div><div class="s" id="cond-noon-dt">--</div></div>
     </div>
     <div style="font-size:10px;color:var(--dimmer);margin-top:4px" id="cond-metar-raw"></div>
+    <div style="font-size:11px;color:var(--dim);margin-top:8px;padding-top:8px;border-top:1px solid #1e293b" id="regime-residual">Precip-gate residual: --</div>
   </div>
 
   <div class="card" id="thp-card" style="display:none">
@@ -3221,6 +3268,24 @@ function render(data){
   } catch(e){ console.error("Today's High Projection render error", e); }
 }
 
+function renderRegimeResidual(data){
+  var el = document.getElementById("regime-residual");
+  var rr = data && data.regime_residual;
+  if(!el || !rr) return;
+  if(!rr.sufficient){
+    el.textContent = "Precip-gate residual: accruing (" + rr.n + "/" + rr.min_days + " days) \u2014 informational only, not applied to TodayCast";
+    el.style.color = "var(--dim)";
+  } else {
+    var sign = rr.mean_error > 0 ? "+" : "";
+    el.textContent = "Precip-gate residual: " + sign + rr.mean_error + "F mean (n=" + rr.n + " days, abs " + rr.mean_abs_error + "F) \u2014 informational only, not applied to TodayCast";
+    el.style.color = Math.abs(rr.mean_error) >= 1 ? "var(--yellow)" : "var(--dim)";
+  }
+}
+
+function pollRegime(){
+  fetch("/api/projection_verification?station="+STATION).then(function(r){ return r.json(); }).then(renderRegimeResidual).catch(function(e){ console.error(e); });
+}
+
 function poll(){
   try { accData = JSON.parse(localStorage.getItem("acc_"+STATION) || "{}"); } catch(e){ accData = {}; }
   if(Object.keys(accData).length){
@@ -3252,7 +3317,7 @@ function startCountdown(){
 document.getElementById("page-title").textContent = STATION + " \u00b7 Model Tracker";
 document.getElementById("page-sub").textContent = STATION_NAMES[STATION] || STATION;
 
-buildForms(); buildDefaultForm(); renderPreview(); poll(); startCountdown(); setInterval(poll,300000);
+buildForms(); buildDefaultForm(); renderPreview(); poll(); pollRegime(); startCountdown(); setInterval(poll,300000); setInterval(pollRegime,1800000);
 
 document.addEventListener("visibilitychange", function(){
   if(document.visibilityState === "visible"){ poll(); }
