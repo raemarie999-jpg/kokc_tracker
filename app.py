@@ -1781,6 +1781,15 @@ def save_consensus_snapshot(station="KOKC"):
     implied = round(consensus + cons_pace, 1) if consensus is not None and cons_pace is not None else None
     if consensus is None:
         return
+    # BUG (present since the v6 _build_consensus_items extraction, fixed here):
+    # obs_temp was referenced below but only ever defined inside
+    # _build_consensus_items()'s own local scope -- a different function.
+    # Python doesn't share locals across function calls, so every call to
+    # save_consensus_snapshot has raised NameError here since v6, silently
+    # swallowed by the caller's try/except, meaning the snapshot never
+    # actually reached the disk-write below. This is what caused the
+    # snapshot dropdown to be stuck, not (only) the minute-gate fixed in v13.
+    obs_temp = (st.get("obs") or {}).get("temperature_display")
     entry = {
         "time": time_str,
         "consensus": consensus,
@@ -1791,7 +1800,16 @@ def save_consensus_snapshot(station="KOKC"):
     }
     snaps = st["consensus_snapshots"]
     snaps = [s for s in snaps if s.get("date") == date_str]
-    snaps.append(entry)
+    # Dedup by time: this function previously always appended, with no check
+    # for an existing entry at the same time_str -- source of the duplicate
+    # rows seen on 2026-07-15 (two calls landing in the same clock minute,
+    # e.g. an auto cycle plus a manual NOW click, each appended separately).
+    # Overwrite the same-time entry instead of adding a second one, matching
+    # the pattern already used in log_projection_snapshot.
+    if snaps and snaps[-1].get("time") == time_str:
+        snaps[-1] = entry
+    else:
+        snaps.append(entry)
     st["consensus_snapshots"] = snaps[-48:]
     try:
         ensure_data_dir()
@@ -1799,7 +1817,11 @@ def save_consensus_snapshot(station="KOKC"):
         disk = load_json_file(path, {})
         if date_str not in disk:
             disk[date_str] = []
-        disk[date_str].append(entry)
+        day_list = disk[date_str]
+        if day_list and day_list[-1].get("time") == time_str:
+            day_list[-1] = entry
+        else:
+            day_list.append(entry)
         keys = sorted(disk.keys())
         if len(keys) > 90:
             for k in keys[:-90]: del disk[k]
