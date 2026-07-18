@@ -124,7 +124,11 @@ STATION_TZ_OFFSET = {
 }
 # Only these stations are fetched automatically by the background loop.
 # All 10 are valid and can be fetched on demand via the NOW button.
-BACKGROUND_STATIONS = ["KOKC", "KPHL", "KDCA"]
+# Expanded from 3 to all 10 in v12 -- v11's 90-min cadence + 5:30am-6pm
+# per-station active window brought 10-station auto-fetch to ~52% of
+# DAILY_REQUEST_CAP (worst-case estimate assuming all 19 models per station;
+# active_models() narrows this once each station has real accuracy history).
+BACKGROUND_STATIONS = ["KOKC", "KPHL", "KDCA", "KBOS", "KDEN", "KHOU", "KLAS", "KMDW", "KMSP", "KSAT"]
 
 # --- Nowcast / conditions constants ---
 # Sky cover boost tiers (oktas -> F bonus): applied to solar-adjusted nowcast
