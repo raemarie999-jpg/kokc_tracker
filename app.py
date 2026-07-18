@@ -266,15 +266,20 @@ ALL_KNOWN_MODELS = [
 ]
 RUN_CYCLES = ["00Z","01Z","02Z","03Z","04Z","05Z","06Z","07Z","08Z","09Z","10Z","11Z",
               "12Z","13Z","14Z","15Z","16Z","17Z","18Z","19Z","20Z","21Z","22Z","23Z"]
-REFRESH_SEC = 1800  # 30 min between auto-refresh cycles; use NOW button for on-demand updates
+REFRESH_SEC = 5400  # 90 min between auto-refresh cycles; use NOW button for on-demand updates
 
-# Quiet hours: auto-fetch (background loop) is skipped during this window to conserve
-# the shared wethr.net daily API cap. Manual refresh (NOW button, /api/refresh) is NOT
-# affected and works 24/7. Window is checked against a single reference station's local
-# clock (not per-station) so all auto-fetch pauses/resumes at the same wall-clock time.
-QUIET_HOURS_START = 19   # 7pm local (24h)
-QUIET_HOURS_END = 5      # 5am local (24h)
-QUIET_HOURS_REF_STATION = "KOKC"
+# Active-fetch window: auto-fetch (background loop) only runs within this
+# window, checked against EACH STATION'S OWN local clock (not one shared
+# reference station -- necessary once BACKGROUND_STATIONS spans multiple
+# time zones, since "6pm" is a different UTC moment for KLAS vs KBOS).
+# Manual refresh (NOW button, /api/refresh) is NOT affected and works 24/7.
+# Chosen specifically for daily-high forecasting: data from well before
+# sunrise or after ~6pm local contributes essentially nothing to a same-day
+# high forecast, so there's no reason to spend API budget on it. A fixed
+# 5:30am start is a deliberate simplification over a real sunrise
+# calculation -- precision before dawn doesn't matter here either way.
+ACTIVE_WINDOW_START_MIN = 5 * 60 + 30   # 5:30am, minutes since local midnight
+ACTIVE_WINDOW_END_MIN = 18 * 60         # 6:00pm
 
 # Typical lag between solar noon and the actual daily high (climatological default;
 # actual lag varies by station/season/air mass, but 3.5hr is a reasonable general value
@@ -286,11 +291,16 @@ TYPICAL_PEAK_LAG_HOURS = 3.5
 # divide-by-near-zero warming rate.
 MIN_INTERVAL_HOURS = 0.15  # ~9 minutes
 
-def in_quiet_hours():
-    hour = station_local_now(QUIET_HOURS_REF_STATION).hour
-    if QUIET_HOURS_START > QUIET_HOURS_END:
-        return hour >= QUIET_HOURS_START or hour < QUIET_HOURS_END
-    return QUIET_HOURS_START <= hour < QUIET_HOURS_END
+def in_quiet_hours(station):
+    """
+    True if it's currently OUTSIDE station's own local active-fetch window
+    (ACTIVE_WINDOW_START_MIN-ACTIVE_WINDOW_END_MIN). Always takes a specific
+    station -- there's no meaningful "global" quiet-hours check anymore now
+    that the window is per-station local time.
+    """
+    now = station_local_now(station)
+    now_min = now.hour * 60 + now.minute
+    return not (ACTIVE_WINDOW_START_MIN <= now_min < ACTIVE_WINDOW_END_MIN)
 
 def make_state():
     return {
@@ -944,6 +954,10 @@ def compute_today_high_projection(station="KOKC"):
         "samples_used": samples_used,
     }
 
+# projection_log_{station}.json retention -- see the pruning note inside
+# log_projection_snapshot for why 21 days is plenty.
+PROJECTION_LOG_RETENTION_DAYS = 21
+
 def log_projection_snapshot(station="KOKC"):
     """
     Records the current today_high_projection result to disk, timestamped —
@@ -1006,6 +1020,15 @@ def log_projection_snapshot(station="KOKC"):
             day[-1] = entry
         else:
             day.append(entry)
+        # Retention: this file had no cap before v11 and grew forever. Nothing
+        # in the codebase reads back more than a day or two (had_recent_precip
+        # looks back days_back=1 by default; the nightly rollup only needs
+        # yesterday) -- the durable long-term record is
+        # projection_verification_{station}.json (one row/day), not this raw
+        # per-cycle log. 21 days is generous headroom over what's actually used.
+        cutoff = (now_local - timedelta(days=PROJECTION_LOG_RETENTION_DAYS)).strftime("%Y-%m-%d")
+        for old_date in [d for d in disk.keys() if d < cutoff]:
+            del disk[old_date]
         save_json_file(log_file, disk)
     except Exception as e:
         add_log(f"Projection log error: {e}", "warn", station)
@@ -1488,22 +1511,28 @@ def scheduled_fetch():
     """
     Auto-fetch background stations only. All 10 stations are valid and fetchable
     on demand via the NOW button; only BACKGROUND_STATIONS run automatically.
-    Skipped entirely during quiet hours (see QUIET_HOURS_START/END) to save API quota;
-    the NOW button still works normally during quiet hours.
+    Each station is checked against its OWN local active-fetch window
+    (ACTIVE_WINDOW_START_MIN-ACTIVE_WINDOW_END_MIN, see in_quiet_hours) rather
+    than one shared gate -- a station outside its window is just skipped for
+    this cycle, the rest are still checked and fetched normally. The NOW
+    button still works normally outside the window for any station.
     """
-    if in_quiet_hours():
-        add_log(
-            f"Quiet hours ({QUIET_HOURS_START}:00-{QUIET_HOURS_END}:00 {QUIET_HOURS_REF_STATION} local) — skipping auto-fetch",
-            "info", QUIET_HOURS_REF_STATION
-        )
-        return
-    for i, station in enumerate(BACKGROUND_STATIONS):
-        if i > 0:
+    fetched_any = False
+    for station in BACKGROUND_STATIONS:
+        if in_quiet_hours(station):
+            add_log(
+                f"Outside active window ({ACTIVE_WINDOW_START_MIN//60}:{ACTIVE_WINDOW_START_MIN%60:02d}-"
+                f"{ACTIVE_WINDOW_END_MIN//60}:00 local) — skipping auto-fetch",
+                "info", station
+            )
+            continue
+        if fetched_any:
             gap = 10 + random.uniform(2, 5)
-            add_log(f"Waiting {gap:.0f}s before fetching next station", "info", BACKGROUND_STATIONS[i-1])
+            add_log(f"Waiting {gap:.0f}s before fetching next station", "info", station)
             time.sleep(gap)
         try:
             fetch_all(station)
+            fetched_any = True
         except Exception as e:
             add_log(f"scheduled_fetch error: {e}", "err", station)
 
