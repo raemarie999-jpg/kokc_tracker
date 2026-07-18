@@ -1417,10 +1417,17 @@ def fetch_all(station="KOKC"):
     except Exception as e:
         add_log(f"Projection snapshot log error: {e}", "warn", station)
 
+    # NOTE: previously gated on now_local.minute landing in :00-:09 or :30-:39,
+    # to throttle this to "twice an hour" back when REFRESH_SEC was 30 min.
+    # That gate was fragile: with a 90-min cadence the loop's minute-of-hour
+    # only ever takes 1-2 fixed values for the life of the process (90 mod 60
+    # = 30), set by whatever minute the loop happened to start on. If that
+    # phase didn't land in the gate window, this silently stopped firing
+    # forever -- which is exactly what happened after a redeploy landed on a
+    # bad phase. REFRESH_SEC (90 min) already throttles call frequency on its
+    # own now, so the extra gate was redundant as well as broken. Removed.
     try:
-        now_local = station_local_now(station)
-        if now_local.minute < 10 or (now_local.minute >= 30 and now_local.minute < 40):
-            save_consensus_snapshot(station)
+        save_consensus_snapshot(station)
     except Exception as e:
         add_log(f"Consensus snapshot error: {e}", "warn", station)
 
@@ -1758,7 +1765,13 @@ def compute_consensus_only(station, st):
 def save_consensus_snapshot(station="KOKC"):
     st = get_state(station)
     now = station_local_now(station)
-    if now.hour < 6 or now.hour >= 22:
+    # Redundant safety net -- fetch_all already only calls this within the
+    # active window (see in_quiet_hours), but kept here in case this is ever
+    # called from elsewhere. Matches ACTIVE_WINDOW_START_MIN/END_MIN directly
+    # rather than a separate hardcoded hour check, which used to be 6am-10pm
+    # and silently skipped the 5:30-5:59am slice of the actual active window.
+    now_min = now.hour * 60 + now.minute
+    if not (ACTIVE_WINDOW_START_MIN <= now_min < ACTIVE_WINDOW_END_MIN):
         return
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H:%M")
