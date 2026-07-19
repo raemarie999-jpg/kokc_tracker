@@ -265,7 +265,7 @@ STATION_WIND_PROFILE = {
 }
 
 ALL_KNOWN_MODELS = [
-    "ARPEGE","HRRR","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NAM-MOS","NBM",
+    "ARPEGE","HRRR","HRRR-EXT","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NAM-MOS","NBM",
     "NAM4KM","GFS","ICON","GFS-MOS","NBS-MOS","ECMWF-HRES","GEFS","JMA","RDPS","SREF"
 ]
 RUN_CYCLES = ["00Z","01Z","02Z","03Z","04Z","05Z","06Z","07Z","08Z","09Z","10Z","11Z",
@@ -1343,7 +1343,7 @@ def fetch_all(station="KOKC"):
                 if not todays:
                     add_log(f"{model}: no entries for today", "warn", station)
                     continue
-                min_entries = 12 if model == "HRRR" else 4
+                min_entries = 12 if model in ("HRRR", "HRRR-EXT") else 4
                 if len(todays) < min_entries:
                     add_log(f"{model}: only {len(todays)} entries for today — run not fully ingested yet, keeping previous", "warn", station)
                     continue
