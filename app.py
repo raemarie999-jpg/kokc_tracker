@@ -2756,13 +2756,15 @@ th.default-col{color:var(--orange) !important}
     <div class="ctitle" style="color:#a78bfa">&#9888; NWS Lead-Time Accuracy</div>
     <p style="color:var(--dim);font-size:12px;line-height:1.7;margin-bottom:12px">
       NWS doesn't have model runs like the other models — its accuracy is tracked by how far out
-      it's forecasting instead (matches wethr.net's own 0-3H / 3-6H / etc. breakdown). Paste that
-      table below. Click the NWS row in the Top 10 table to include/exclude it from consensus once
-      you've got numbers in here.
+      it's forecasting instead: 0-3H / 3-6H / 6-12H / 12-18H / 18-24H, matching wethr.net's
+      "Accuracy by Lead Time" table. Select and copy the whole NWS row from that table (Model,
+      then MAE/Correction/N repeated per bucket — wethr.net has no RMSE column here) and paste it
+      below as-is; a bucket showing "—" is skipped. Click the NWS row in the Top 10 table to
+      include/exclude it from consensus once you've got numbers in here.
     </p>
     <div style="margin-bottom:14px;padding:10px;background:#1a1a2e;border:1px solid #334155;border-radius:6px">
-      <div style="font-size:10px;color:#a78bfa;letter-spacing:1px;margin-bottom:6px">&#9657; PASTE FROM WETHR.NET (NWS ROW, BY LEAD-TIME BUCKET)</div>
-      <textarea id="nws-paste-input" rows="5" style="width:100%;background:#0f0f1a;border:1px solid #334155;color:var(--text);border-radius:4px;padding:8px;font-size:11px;font-family:monospace;box-sizing:border-box;resize:vertical" placeholder="BUCKET&#9;MAE&#9;CORRECTION&#9;RMSE&#9;N&#10;0-3H&#9;2.3°&#9;-0.8°F&#9;2.2°&#9;4&#10;3-6H&#9;1.9°&#9;-0.5°F&#9;2.0°&#9;4&#10;..."></textarea>
+      <div style="font-size:10px;color:#a78bfa;letter-spacing:1px;margin-bottom:6px">&#9657; PASTE THE NWS ROW FROM WETHR.NET (ONE LINE)</div>
+      <textarea id="nws-paste-input" rows="3" style="width:100%;background:#0f0f1a;border:1px solid #334155;color:var(--text);border-radius:4px;padding:8px;font-size:11px;font-family:monospace;box-sizing:border-box;resize:vertical" placeholder="NWS&#9;1.2°&#9;-0.4°&#9;5&#9;—&#9;—&#9;—&#9;1.7°&#9;+0.3°&#9;3&#9;1.0°&#9;-0.1°&#9;9&#9;2.0°&#9;+1.0°&#9;2"></textarea>
       <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
         <button class="btn btn-blue" onclick="saveNwsAccuracy()">Save NWS Accuracy</button>
         <span id="nws-paste-status" style="font-size:10px;color:var(--dim)"></span>
@@ -3630,31 +3632,42 @@ function toggleModel(model, currentlyEnabled){
   }).then(function(r){ return r.json(); }).then(function(){ poll(); }).catch(function(e){ console.error(e); });
 }
 
+// Fixed positional order matching wethr.net's "Accuracy by Lead Time" table
+// columns, confirmed against an actual paste. The pasted NWS row carries no
+// bucket labels of its own (those are column headers, which don't come
+// along when you copy a table row) -- so the mapping has to be positional
+// and has to match wethr.net's actual column order exactly, not a guess.
+var NWS_BUCKET_LABELS = ["0-3H","3-6H","6-12H","12-18H","18-24H"];
+
 function saveNwsAccuracy(){
   var raw = (document.getElementById("nws-paste-input").value || "").trim();
   var status = document.getElementById("nws-paste-status");
   if(!raw){ status.textContent = "Nothing to parse."; return; }
+  // Real paste shape (one line): "NWS  1.2°  -0.4°  5  —  —  —  1.7°  +0.3°  3  ..."
+  // -- the model name, then MAE/CORRECTION/N triples, one triple per bucket
+  // in NWS_BUCKET_LABELS order. wethr.net has no RMSE column for this table.
+  // A missing bucket shows as "—" for all three of its fields.
+  var cols = raw.split(/\t+|\s{2,}/).map(function(s){ return s.trim(); }).filter(function(s){ return s.length; });
+  if(cols.length && cols[0].toUpperCase() === "NWS") cols = cols.slice(1);
   var buckets = {};
   var parsed = 0, skipped = 0;
-  raw.split("\n").forEach(function(line){
-    line = line.trim();
-    if(!line || line.toLowerCase().startsWith("bucket")) return; // skip header
-    var cols = line.split(/\t+|\s{2,}/);
-    if(cols.length < 3){ skipped++; return; }
-    var bucket = cols[0].trim().toUpperCase();
-    var mae = parseFloat(cols[1].replace(/[°\s]/g, ""));
-    var corr = parseFloat(cols[2].replace(/[°F\s]/g, ""));
-    var rmse = cols[3] ? parseFloat(cols[3].replace(/[°\s]/g, "")) : null;
-    var n = cols[4] ? parseInt(cols[4].replace(/\D/g, "")) : null;
-    if(isNaN(mae) || isNaN(corr)){ skipped++; return; }
-    buckets[bucket] = {mae: mae, correction: corr, rmse: isNaN(rmse) ? null : rmse, n: isNaN(n) ? null : n};
+  for(var b = 0; b < NWS_BUCKET_LABELS.length; b++){
+    var base = b * 3;
+    if(base + 2 >= cols.length) break; // fewer triples pasted than expected buckets -- stop, don't guess
+    var maeRaw = cols[base], corrRaw = cols[base+1], nRaw = cols[base+2];
+    if(maeRaw === "—" || maeRaw === "-" || corrRaw === "—" || corrRaw === "-"){ skipped++; continue; }
+    var mae = parseFloat(maeRaw.replace(/[°\s]/g, ""));
+    var corr = parseFloat(corrRaw.replace(/[°F\s]/g, ""));
+    var n = parseInt(nRaw.replace(/\D/g, ""), 10);
+    if(isNaN(mae) || isNaN(corr)){ skipped++; continue; }
+    buckets[NWS_BUCKET_LABELS[b]] = {mae: mae, correction: corr, rmse: null, n: isNaN(n) ? null : n};
     parsed++;
-  });
-  if(!parsed){ status.textContent = "No valid rows found — check the format."; return; }
+  }
+  if(!parsed){ status.textContent = "No valid buckets found — check the format."; return; }
   fetch("/api/nws_accuracy?station="+STATION,{
     method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(buckets)
   }).then(function(r){ return r.json(); }).then(function(){
-    status.textContent = "Saved "+parsed+" bucket(s)"+(skipped?", skipped "+skipped:"")+".";
+    status.textContent = "Saved "+parsed+" bucket(s)"+(skipped?", "+skipped+" skipped (—)":"")+".";
     loadNwsAccuracy();
     poll();
   }).catch(function(e){ status.textContent = "Save failed: "+e; });
