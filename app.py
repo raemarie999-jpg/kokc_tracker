@@ -3648,6 +3648,17 @@ function saveNwsAccuracy(){
   // in NWS_BUCKET_LABELS order. wethr.net has no RMSE column for this table.
   // A missing bucket shows as "—" for all three of its fields.
   var cols = raw.split(/\t+|\s{2,}/).map(function(s){ return s.trim(); }).filter(function(s){ return s.length; });
+  // Guard against stale textarea content: if a paste lands on top of
+  // leftover text from before (rather than replacing it), a second "NWS"
+  // token ends up buried mid-stream. Only the leading one gets stripped
+  // below, so everything after silently shifts out of position -- this is
+  // exactly what produced shuffled/mislabeled buckets once already. Reject
+  // outright rather than guess which "NWS" is the real one.
+  var nwsTokenCount = cols.filter(function(c){ return c.toUpperCase() === "NWS"; }).length;
+  if(nwsTokenCount > 1){
+    status.textContent = "Found "+nwsTokenCount+' "NWS" tokens in the pasted text — looks like old content is still in the box. Clear it and paste just the one row.';
+    return;
+  }
   if(cols.length && cols[0].toUpperCase() === "NWS") cols = cols.slice(1);
   var buckets = {};
   var parsed = 0, skipped = 0;
@@ -3663,11 +3674,20 @@ function saveNwsAccuracy(){
     buckets[NWS_BUCKET_LABELS[b]] = {mae: mae, correction: corr, rmse: null, n: isNaN(n) ? null : n};
     parsed++;
   }
+  // Extra tokens beyond the 5 expected buckets (15 fields) is the other
+  // signature of leftover/duplicated content -- flag it even when the first
+  // 5 buckets happened to parse fine, since it means something is off with
+  // what's in the box.
+  if(cols.length > NWS_BUCKET_LABELS.length * 3){
+    status.textContent = "Warning: pasted text has more fields than expected ("+cols.length+" vs "+(NWS_BUCKET_LABELS.length*3)+") — double-check the box only has one row before saving again.";
+    return;
+  }
   if(!parsed){ status.textContent = "No valid buckets found — check the format."; return; }
   fetch("/api/nws_accuracy?station="+STATION,{
     method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(buckets)
   }).then(function(r){ return r.json(); }).then(function(){
     status.textContent = "Saved "+parsed+" bucket(s)"+(skipped?", "+skipped+" skipped (—)":"")+".";
+    document.getElementById("nws-paste-input").value = ""; // clear so stale content can't concatenate with a future paste
     loadNwsAccuracy();
     poll();
   }).catch(function(e){ status.textContent = "Save failed: "+e; });
