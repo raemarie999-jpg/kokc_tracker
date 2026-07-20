@@ -1,4 +1,4 @@
-import os, json, time, threading, random, math
+import os, json, time, threading, random, math, re
 from datetime import datetime, timedelta
 from flask import Flask, jsonify, request, render_template_string
 import requests
@@ -268,6 +268,47 @@ ALL_KNOWN_MODELS = [
     "ARPEGE","HRRR","HRRR-EXT","UKMO","LAV-MOS","NAM","RAP","GEM-GDPS","NAM-MOS","NBM",
     "NAM4KM","GFS","ICON","GFS-MOS","NBS-MOS","ECMWF-HRES","GEFS","JMA","RDPS","SREF"
 ]
+
+def get_model_overrides(station):
+    """
+    Per-station model include/exclude toggle state, set via the Top 10 table
+    (click a row) or /api/model_toggle. Stored separately from
+    accuracy_{station}.json on purpose: that file gets wholesale-replaced by
+    the morning paste workflow, so toggle state would get silently wiped
+    every time new accuracy numbers are pasted if it lived there instead.
+    """
+    return load_json_file(f"{DATA_DIR}/model_overrides_{station}.json", {})
+
+def is_model_enabled(model, overrides):
+    """NWS defaults excluded (matches behavior before this toggle existed);
+    every other model defaults included. Only entries the user has actually
+    clicked appear in the overrides dict at all."""
+    if model == "NWS":
+        return overrides.get("NWS", False)
+    return overrides.get(model, True)
+
+def get_active_models(station, acc):
+    """
+    Single source of truth for which models participate in consensus/
+    TodayCast/pacing. Replaces ~7 scattered `if m != "NWS"` filters that
+    used to be duplicated across api_state, _build_consensus_items, pacing,
+    and several frontend JS spots -- consolidated here after the obs_temp
+    bug showed how that kind of duplication drifts out of sync over time.
+
+    NWS is force-included as a candidate even though it's never a real key
+    in acc (its accuracy lives in nws_accuracy_{station}.json, not the main
+    accuracy blob) -- without this, toggling NWS "on" would have no visible
+    effect here, silently contradicting the toggle. Callers that need to
+    exclude NWS for a different reason (e.g. active_models() below, which is
+    specifically about wethr.net fetch targets and must never include NWS
+    regardless of toggle state) filter it back out themselves.
+    """
+    overrides = get_model_overrides(station)
+    keys = list(acc.keys()) if acc else list(ALL_KNOWN_MODELS)
+    if "NWS" not in keys:
+        keys = keys + ["NWS"]
+    return [m for m in keys if is_model_enabled(m, overrides)]
+
 RUN_CYCLES = ["00Z","01Z","02Z","03Z","04Z","05Z","06Z","07Z","08Z","09Z","10Z","11Z",
               "12Z","13Z","14Z","15Z","16Z","17Z","18Z","19Z","20Z","21Z","22Z","23Z"]
 REFRESH_SEC = 5400  # 90 min between auto-refresh cycles; use NOW button for on-demand updates
@@ -330,9 +371,16 @@ def get_state(station=None):
     return states.get(station or "KOKC", states["KOKC"])
 
 def active_models(station="KOKC"):
+    """
+    Which models to actually FETCH from wethr.net this cycle (fetch_targets).
+    NOT the same question as "which models participate in consensus" --
+    get_active_models() force-includes NWS as a toggle candidate for that
+    purpose, but NWS is never fetched via wethr_get (it comes from
+    fetch_nws_forecast/api.weather.gov instead), so it's explicitly excluded
+    here regardless of toggle state.
+    """
     acc = get_state(station).get("accuracy", {})
-    models = [m for m in acc.keys() if m != "NWS"] if acc else ALL_KNOWN_MODELS
-    return models
+    return [m for m in get_active_models(station, acc) if m != "NWS"]
 
 def add_log(msg, level="info", station="KOKC"):
     entry = {"t": datetime.now().strftime("%H:%M:%S"), "msg": msg, "level": level}
@@ -573,6 +621,96 @@ def solar_noon_utc(station, date_utc=None):
     h = int(solar_noon_utc_min // 60) % 24
     mins = int(solar_noon_utc_min % 60)
     return datetime(date_utc.year, date_utc.month, date_utc.day, h, mins, 0)
+
+def hours_until_expected_high(station):
+    """
+    Hours from now until today's expected high time (solar noon +
+    TYPICAL_PEAK_LAG_HOURS) -- same value compute_nowcast computes internally
+    as hours_to_peak, factored out here for reuse. Used as the lead-time
+    input for NWS's bucketed accuracy lookup (see get_nws_bucket_correction):
+    unlike the other models, NWS forecasts don't have distinct run cycles to
+    key a correction off of -- its accuracy instead varies by how far out
+    it's forecasting, same idea as wethr.net's own 0-3H/3-6H/etc. breakdown.
+    """
+    now_utc = datetime.utcnow()
+    noon_utc = solar_noon_utc(station, now_utc.date())
+    peak_utc = noon_utc + timedelta(hours=TYPICAL_PEAK_LAG_HOURS)
+    return (peak_utc - now_utc).total_seconds() / 3600.0
+
+def _parse_lead_bucket_label(label):
+    """
+    Parse a lead-time bucket label like '0-3H' or '6-12H' into (lo, hi)
+    hours. Deliberately flexible (not a hardcoded set of boundaries) since
+    the exact bucket scheme should match whatever wethr.net's own accuracy
+    table uses -- entered by hand, not guessed at here. Returns None for
+    anything that doesn't match the pattern.
+    """
+    m = re.match(r'^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*H\s*$', (label or "").upper())
+    if not m:
+        return None
+    return float(m.group(1)), float(m.group(2))
+
+def get_nws_bucket_correction(station, lead_hours):
+    """
+    Look up NWS's bias correction for the current forecast lead time, from
+    nws_accuracy_{station}.json -- a separate, manually-entered table keyed
+    by lead-time-bucket label (e.g. "0-3H") rather than by model run, since
+    NWS doesn't have run cycles like the other models. Falls back to a
+    simple average across all entered buckets if lead_hours doesn't fall
+    into any of them; returns (None, None, None) if nothing's been entered
+    at all -- callers treat that the same as "no correction available" for
+    any other model.
+    Returns (correction, mae, rmse).
+    """
+    buckets = load_json_file(f"{DATA_DIR}/nws_accuracy_{station}.json", {})
+    if not buckets:
+        return None, None, None
+    for label, data in buckets.items():
+        rng = _parse_lead_bucket_label(label)
+        if rng and rng[0] <= lead_hours < rng[1]:
+            return data.get("correction"), data.get("mae"), data.get("rmse")
+    corrections = [b.get("correction") for b in buckets.values() if b.get("correction") is not None]
+    maes = [b.get("mae") for b in buckets.values() if b.get("mae") is not None]
+    rmses = [b.get("rmse") for b in buckets.values() if b.get("rmse") is not None]
+    avg_corr = round(sum(corrections) / len(corrections), 2) if corrections else None
+    avg_mae = round(sum(maes) / len(maes), 2) if maes else None
+    avg_rmse = round(sum(rmses) / len(rmses), 2) if rmses else None
+    return avg_corr, avg_mae, avg_rmse
+
+def build_nws_item(station, st):
+    """
+    Builds a single cons_item-shaped dict for NWS (raw forecast + lead-time-
+    bucket correction), if there's both a raw forecast and a matching/average
+    bucket correction available -- same "not enough data yet" semantics as
+    any other model missing its correction. Returns None otherwise.
+
+    NWS needs this separate path because it doesn't fit the other models'
+    shape: no wethr.net forecast entry (st["forecasts"] never has "NWS" --
+    that comes from fetch_nws_forecast into st["nws_forecast"] instead), and
+    no run-cycle-keyed accuracy (correction is looked up by forecast lead
+    time via get_nws_bucket_correction instead of get_run_data).
+
+    Shared by api_state's Top 10 table row and _build_consensus_items's
+    deeper pipeline (save_consensus_snapshot, log_projection_snapshot,
+    verification) so both always treat NWS identically -- one source of
+    truth for the actual adjustment math, not two copies that can drift.
+    """
+    nws = st.get("nws_forecast") or {}
+    raw = nws.get("high")
+    if raw is None:
+        return None
+    lead_hours = hours_until_expected_high(station)
+    corr, mae_val, rmse_val = get_nws_bucket_correction(station, lead_hours)
+    if corr is None:
+        return None
+    try:
+        adj = round(float(raw) + float(corr), 1)
+    except (TypeError, ValueError):
+        return None
+    return {
+        "raw": raw, "adj": adj, "correction": corr,
+        "mae": mae_val, "rmse": rmse_val, "lead_hours": round(lead_hours, 1),
+    }
 
 def solar_elevation_deg(station, dt_utc):
     """Compute solar elevation angle in degrees for station at given UTC datetime."""
@@ -1505,7 +1643,7 @@ def rollup_daily_history(station="KOKC"):
 def build_snapshot_rows(station="KOKC"):
     st = get_state(station)
     acc = st["accuracy"]
-    models = [m for m in acc.keys() if m != "NWS"] if acc else ALL_KNOWN_MODELS
+    models = get_active_models(station, acc)
     obs_temp = (st["obs"] or {}).get("temperature_display")
     rows = []
     for model in models:
@@ -1717,11 +1855,13 @@ def _build_consensus_items(station, st):
     """
     acc = st.get("accuracy", {})
     forecasts = st.get("forecasts", {})
-    models = [m for m in acc.keys() if m != "NWS"]
+    models = get_active_models(station, acc)
     cons_items = []
     pace_items = []
     obs_temp = (st.get("obs") or {}).get("temperature_display")
     for model in models:
+        if model == "NWS":
+            continue  # handled separately below -- different data shape (see build_nws_item)
         a = acc.get(model, {})
         fcst = forecasts.get(model, {})
         raw = fcst.get("high")
@@ -1748,6 +1888,17 @@ def _build_consensus_items(station, st):
             if pace is not None:
                 pace_items.append({"value": pace, "mae": mae_val, "rmse": rmse_val, "run": current_run})
         except: pass
+    if is_model_enabled("NWS", get_model_overrides(station)):
+        nws_item = build_nws_item(station, st)
+        if nws_item and nws_item.get("mae"):
+            cons_items.append({
+                "value": nws_item["adj"], "mae": nws_item["mae"],
+                "rmse": nws_item.get("rmse"), "run": "NWS",
+            })
+        # No pace_items entry for NWS: it has no continuously-updated
+        # "current_fcst" trend field like the wethr.net models do (it's a
+        # periods-based forecast, not a run), so a pace comparison wouldn't
+        # mean the same thing here.
     return cons_items, pace_items
 
 def compute_consensus_only(station, st):
@@ -1860,9 +2011,16 @@ def api_state():
         station = "KOKC"
     st = get_state(station)
     acc = st["accuracy"]
-    models = active_models(station)
+    overrides = get_model_overrides(station)
+    # Show ALL known models here, not just enabled ones -- a disabled model
+    # needs to still appear (grayed out via its "enabled" flag) so it can be
+    # clicked to re-enable. Filtering happens later, in the cons_items/
+    # pace_items loops below, not by excluding rows from the table itself.
+    models = list(acc.keys()) if acc else list(ALL_KNOWN_MODELS)
     rows = []
     for i, model in enumerate(models):
+        if model == "NWS":
+            continue  # handled separately below -- different data shape (see build_nws_item)
         a = acc.get(model, {})
         fcst = st["forecasts"].get(model, {})
         raw = fcst.get("high")
@@ -1895,7 +2053,7 @@ def api_state():
         except: tmr_low_adj = tmr_low
 
         rows.append({
-            "rank": i+1, "model": model,
+            "rank": i+1, "model": model, "enabled": is_model_enabled(model, overrides),
             "run": fcst.get("run","—"),
             "raw_high": raw, "correction": corr,
             "corr_source": corr_source,   # "run", "default", or "overall"
@@ -1908,8 +2066,34 @@ def api_state():
             "cloud_cover": _safe_float(fcst.get("cloud_cover")),
         })
 
+    # NWS row: separate construction, not part of the loop above, since it
+    # has no wethr.net forecast entry and no run-cycle-keyed accuracy (see
+    # build_nws_item). Always shown (defaults to enabled=False, grayed out
+    # in the UI) so it can be clicked on from the same table -- not hidden
+    # entirely, since a toggle you can't see is a toggle you can't use.
+    nws_enabled = is_model_enabled("NWS", overrides)
+    nws_item = build_nws_item(station, st)
+    nws = st.get("nws_forecast") or {}
+    rows.append({
+        "rank": len(rows)+1, "model": "NWS", "enabled": nws_enabled,
+        "run": f"{nws_item['lead_hours']}h lead" if nws_item else "—",
+        "raw_high": nws.get("high"),
+        "correction": nws_item["correction"] if nws_item else None,
+        "corr_source": "lead_bucket" if nws_item else None,
+        "adj_high": nws_item["adj"] if nws_item else None,
+        "pace": None,
+        "tmr_high": None, "tmr_adj": None,
+        "tmr_low": None, "tmr_low_adj": None, "tmr_low_time": None,
+        "mae": nws_item["mae"] if nws_item else None,
+        "rmse": nws_item.get("rmse") if nws_item else None,
+        "runs": {},
+        "conditions": None, "cloud_cover": None,
+    })
+
     cons_items = []
     for r in rows:
+        if not r.get("enabled", True):
+            continue
         try:
             mae = float(r["mae"]); adj = r["adj_high"] if r["adj_high"] is not None else r["raw_high"]
             if adj is not None:
@@ -1920,6 +2104,8 @@ def api_state():
 
     pace_items = []
     for r in rows:
+        if not r.get("enabled", True):
+            continue
         try:
             mae = float(r["mae"]); pace = r["pace"]
             if pace is not None:
@@ -1929,6 +2115,8 @@ def api_state():
 
     tmr_items = []
     for r in rows:
+        if not r.get("enabled", True):
+            continue
         try:
             mae = float(r["mae"]); tadj = r["tmr_adj"] if r["tmr_adj"] is not None else r["tmr_high"]
             if tadj is not None:
@@ -1964,8 +2152,8 @@ def api_state():
 
     return jsonify({
         "station": station, "obs": st["obs"], "wethr_high": st["wethr_high"],
-        "nws_forecast": st.get("nws_forecast"),
-        "rows": rows, "consensus": consensus, "consensus_spread": spread,
+        "nws_forecast": st.get("nws_forecast"), "nws_adjusted": nws_item,
+        "rows": rows, "consensus": consensus, "consensus_spread": spread, "model_overrides": overrides,
         "last_updated": st["last_updated"], "errors": st["errors"],
         "log": st["log"][:30], "models": active_models(station),
         "nws_versions": st["nws_versions"],
@@ -2123,6 +2311,51 @@ def save_accuracy():
     get_state(station)["accuracy"] = request.json or {}
     add_log("Accuracy data updated", "ok", station)
     save_json_file(f"{DATA_DIR}/accuracy_{station}.json", request.json or {})
+    return jsonify({"ok": True})
+
+@app.route("/api/model_toggle", methods=["POST"])
+def api_model_toggle():
+    """
+    Toggle whether a model participates in consensus/TodayCast/pacing for a
+    given station (per-station, not global). Persisted separately from
+    accuracy_{station}.json on purpose -- that file gets wholesale-replaced
+    by the morning paste, so toggle state would be silently wiped every time
+    new numbers are pasted if it lived there instead. Applies immediately;
+    the next /api/state call reflects it.
+    """
+    station = request.args.get("station", "KOKC").upper()
+    if station not in STATIONS:
+        return jsonify({"error": "unknown station"}), 400
+    data = request.json or {}
+    model = data.get("model")
+    enabled = data.get("enabled")
+    if not model or enabled is None:
+        return jsonify({"error": "model and enabled required"}), 400
+    path = f"{DATA_DIR}/model_overrides_{station}.json"
+    overrides = load_json_file(path, {})
+    overrides[model] = bool(enabled)
+    save_json_file(path, overrides)
+    add_log(f"{model} {'enabled' if enabled else 'disabled'} for consensus", "ok", station)
+    return jsonify({"station": station, "model": model, "enabled": bool(enabled), "overrides": overrides})
+
+@app.route("/api/nws_accuracy", methods=["GET", "POST"])
+def api_nws_accuracy():
+    """
+    NWS's lead-time-bucketed accuracy table (e.g. {"0-3H": {"mae":,
+    "correction":, "rmse":, "n":}, ...}) -- kept in its own file, separate
+    from accuracy_{station}.json, since NWS's accuracy varies by forecast
+    lead time rather than by model run and needs its own entry format
+    (matching wethr.net's own 0-3H/3-6H/etc. breakdown) rather than being
+    forced into the run-keyed shape the other models use.
+    """
+    station = request.args.get("station", "KOKC").upper()
+    if station not in STATIONS:
+        station = "KOKC"
+    path = f"{DATA_DIR}/nws_accuracy_{station}.json"
+    if request.method == "GET":
+        return jsonify({"station": station, "buckets": load_json_file(path, {})})
+    save_json_file(path, request.json or {})
+    add_log("NWS lead-time accuracy data updated", "ok", station)
     return jsonify({"ok": True})
 
 @app.route("/api/consensus_snapshots")
@@ -2515,6 +2748,34 @@ th.default-col{color:var(--orange) !important}
       <button class="btn btn-green" onclick="saveDefaults()">Save Defaults</button>
       <button class="btn btn-red" onclick="clearDefaults()">Clear Defaults</button>
       <span style="font-size:10px;color:var(--dim)" id="default-status"></span>
+    </div>
+  </div>
+
+  <!-- NWS LEAD-TIME ACCURACY -->
+  <div class="card" style="border-color:#3a2a5a">
+    <div class="ctitle" style="color:#a78bfa">&#9888; NWS Lead-Time Accuracy</div>
+    <p style="color:var(--dim);font-size:12px;line-height:1.7;margin-bottom:12px">
+      NWS doesn't have model runs like the other models — its accuracy is tracked by how far out
+      it's forecasting instead (matches wethr.net's own 0-3H / 3-6H / etc. breakdown). Paste that
+      table below. Click the NWS row in the Top 10 table to include/exclude it from consensus once
+      you've got numbers in here.
+    </p>
+    <div style="margin-bottom:14px;padding:10px;background:#1a1a2e;border:1px solid #334155;border-radius:6px">
+      <div style="font-size:10px;color:#a78bfa;letter-spacing:1px;margin-bottom:6px">&#9657; PASTE FROM WETHR.NET (NWS ROW, BY LEAD-TIME BUCKET)</div>
+      <textarea id="nws-paste-input" rows="5" style="width:100%;background:#0f0f1a;border:1px solid #334155;color:var(--text);border-radius:4px;padding:8px;font-size:11px;font-family:monospace;box-sizing:border-box;resize:vertical" placeholder="BUCKET&#9;MAE&#9;CORRECTION&#9;RMSE&#9;N&#10;0-3H&#9;2.3°&#9;-0.8°F&#9;2.2°&#9;4&#10;3-6H&#9;1.9°&#9;-0.5°F&#9;2.0°&#9;4&#10;..."></textarea>
+      <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
+        <button class="btn btn-blue" onclick="saveNwsAccuracy()">Save NWS Accuracy</button>
+        <span id="nws-paste-status" style="font-size:10px;color:var(--dim)"></span>
+      </div>
+    </div>
+    <div style="overflow-x:auto">
+      <table style="width:100%;border-collapse:collapse;font-size:11px">
+        <thead><tr style="color:var(--dim);text-align:left">
+          <th style="padding:4px 8px">BUCKET</th><th style="padding:4px 8px">MAE</th>
+          <th style="padding:4px 8px">CORRECTION</th><th style="padding:4px 8px">RMSE</th><th style="padding:4px 8px">N</th>
+        </tr></thead>
+        <tbody id="nws-buckets-tbody"><tr><td colspan="5" style="color:var(--dim);padding:8px">No NWS accuracy data yet.</td></tr></tbody>
+      </table>
     </div>
   </div>
 
@@ -3022,14 +3283,19 @@ function render(data){
   document.getElementById("s-mods").textContent = rows.filter(function(r){ return r.raw_high!=null; }).length+"/"+rows.length;
 
   document.getElementById("main-tbody").innerHTML = rows.map(function(r,i){
+    var enabled = r.enabled !== false;
     var bg = i%2?"background:#0a1018":"";
+    if(!enabled) bg = "background:#0a0a0a;opacity:0.45";
     // Correction source badge
     var corrBadge = "";
     if(r.corr_source === "run") corrBadge = ' <span style="font-size:9px;color:#38bdf8" title="Run-specific correction">R</span>';
     else if(r.corr_source === "default") corrBadge = ' <span style="font-size:9px;color:var(--orange);font-weight:700" title="Using default fallback">D</span>';
-    return '<tr style="'+bg+'">'
+    else if(r.corr_source === "lead_bucket") corrBadge = ' <span style="font-size:9px;color:#a78bfa" title="NWS lead-time bucket correction">L</span>';
+    var modelLabel = r.model + (enabled ? "" : " (off)");
+    var modelStyle = "color:#e8f0f8;font-weight:600;cursor:pointer;text-decoration:"+(enabled?"none":"line-through");
+    return '<tr style="'+bg+'" onclick="toggleModel(\''+r.model+'\','+enabled+')" title="Click to '+(enabled?"exclude":"include")+' this model in consensus">'
       +'<td style="color:var(--dim)">#'+r.rank+'</td>'
-      +'<td style="color:#e8f0f8;font-weight:600">'+r.model+'</td>'
+      +'<td style="'+modelStyle+'">'+modelLabel+'</td>'
       +'<td style="color:var(--dim);font-size:11px">'+(r.run||"--")+'</td>'
       +'<td style="color:var(--yellow)">'+(r.raw_high!=null?r.raw_high+"F":"--")+'</td>'
       +'<td style="color:'+corrColor(r.correction)+'">'+(r.correction!=null&&r.correction!==""?fmtC(r.correction)+corrBadge:"--")+'</td>'
@@ -3044,7 +3310,7 @@ function render(data){
       +'<td style="color:var(--dim)">'+(r.rmse?fmt1(r.rmse)+"F":"--")+'</td></tr>';
   }).join("");
 
-  var paceRows = rows.filter(function(r){ return r.pace!=null; });
+  var paceRows = rows.filter(function(r){ return r.pace!=null && r.enabled !== false; });
   if(paceRows.length && obs){
     document.getElementById("pace-card").style.display="block";
     document.getElementById("pbars").innerHTML = paceRows.map(function(r){
@@ -3354,6 +3620,66 @@ function pollRegime(){
   fetch("/api/projection_verification?station="+STATION).then(function(r){ return r.json(); }).then(renderRegimeResidual).catch(function(e){ console.error(e); });
 }
 
+function toggleModel(model, currentlyEnabled){
+  var next = !currentlyEnabled;
+  var label = next ? "include" : "exclude";
+  if(!confirm((next?"Include ":"Exclude ")+model+(next?" in":" from")+" consensus calculations for "+STATION+"?")) return;
+  fetch("/api/model_toggle?station="+STATION,{
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({model: model, enabled: next})
+  }).then(function(r){ return r.json(); }).then(function(){ poll(); }).catch(function(e){ console.error(e); });
+}
+
+function saveNwsAccuracy(){
+  var raw = (document.getElementById("nws-paste-input").value || "").trim();
+  var status = document.getElementById("nws-paste-status");
+  if(!raw){ status.textContent = "Nothing to parse."; return; }
+  var buckets = {};
+  var parsed = 0, skipped = 0;
+  raw.split("\n").forEach(function(line){
+    line = line.trim();
+    if(!line || line.toLowerCase().startsWith("bucket")) return; // skip header
+    var cols = line.split(/\t+|\s{2,}/);
+    if(cols.length < 3){ skipped++; return; }
+    var bucket = cols[0].trim().toUpperCase();
+    var mae = parseFloat(cols[1].replace(/[°\s]/g, ""));
+    var corr = parseFloat(cols[2].replace(/[°F\s]/g, ""));
+    var rmse = cols[3] ? parseFloat(cols[3].replace(/[°\s]/g, "")) : null;
+    var n = cols[4] ? parseInt(cols[4].replace(/\D/g, "")) : null;
+    if(isNaN(mae) || isNaN(corr)){ skipped++; return; }
+    buckets[bucket] = {mae: mae, correction: corr, rmse: isNaN(rmse) ? null : rmse, n: isNaN(n) ? null : n};
+    parsed++;
+  });
+  if(!parsed){ status.textContent = "No valid rows found — check the format."; return; }
+  fetch("/api/nws_accuracy?station="+STATION,{
+    method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(buckets)
+  }).then(function(r){ return r.json(); }).then(function(){
+    status.textContent = "Saved "+parsed+" bucket(s)"+(skipped?", skipped "+skipped:"")+".";
+    loadNwsAccuracy();
+    poll();
+  }).catch(function(e){ status.textContent = "Save failed: "+e; });
+}
+
+function loadNwsAccuracy(){
+  fetch("/api/nws_accuracy?station="+STATION).then(function(r){ return r.json(); }).then(function(data){
+    var buckets = data.buckets || {};
+    var tbody = document.getElementById("nws-buckets-tbody");
+    var keys = Object.keys(buckets);
+    if(!keys.length){
+      tbody.innerHTML = '<tr><td colspan="5" style="color:var(--dim);padding:8px">No NWS accuracy data yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = keys.map(function(b){
+      var d = buckets[b];
+      return '<tr><td style="padding:4px 8px;color:#e8f0f8;font-weight:600">'+b+'</td>'
+        +'<td style="padding:4px 8px">'+(d.mae!=null?d.mae+"°":"--")+'</td>'
+        +'<td style="padding:4px 8px;color:'+corrColor(d.correction)+'">'+(d.correction!=null?fmtC(d.correction):"--")+'</td>'
+        +'<td style="padding:4px 8px">'+(d.rmse!=null?d.rmse+"°":"--")+'</td>'
+        +'<td style="padding:4px 8px;color:var(--dim)">'+(d.n!=null?d.n:"--")+'</td></tr>';
+    }).join("");
+  }).catch(function(e){ console.error(e); });
+}
+
 function poll(){
   try { accData = JSON.parse(localStorage.getItem("acc_"+STATION) || "{}"); } catch(e){ accData = {}; }
   if(Object.keys(accData).length){
@@ -3385,7 +3711,7 @@ function startCountdown(){
 document.getElementById("page-title").textContent = STATION + " \u00b7 Model Tracker";
 document.getElementById("page-sub").textContent = STATION_NAMES[STATION] || STATION;
 
-buildForms(); buildDefaultForm(); renderPreview(); poll(); pollRegime(); startCountdown(); setInterval(poll,300000); setInterval(pollRegime,1800000);
+buildForms(); buildDefaultForm(); renderPreview(); poll(); pollRegime(); loadNwsAccuracy(); startCountdown(); setInterval(poll,300000); setInterval(pollRegime,1800000);
 
 document.addEventListener("visibilitychange", function(){
   if(document.visibilityState === "visible"){ poll(); }
