@@ -2938,6 +2938,11 @@ function switchStation(s){
   document.getElementById("page-sub").textContent = STATION_NAMES[s] || s;
   document.getElementById("page-title").textContent = s + " \u00b7 Model Tracker";
   buildForms(); buildDefaultForm(); renderPreview(); poll();
+  // The NWS accuracy card only reloads on page init or after a save --
+  // without this it kept showing whichever station's buckets were loaded
+  // last, which looked like NWS data was shared across stations when the
+  // backend was actually correctly isolating it per station all along.
+  loadNwsAccuracy();
 }
 
 var MANUAL_RUNS = ["00Z","03Z","06Z","09Z","12Z","15Z","18Z","21Z"];
